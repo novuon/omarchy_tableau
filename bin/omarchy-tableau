@@ -1,0 +1,1619 @@
+#!/usr/bin/env python3
+"""omarchy-tableau -- load, switch and save Hyprland desktop setups.
+
+The engine behind the Setups bar plugin. Everything the panel can do is a
+subcommand here, so the whole thing is usable (and debuggable) from a shell:
+
+    omarchy-tableau status --json
+    omarchy-tableau load Work
+    omarchy-tableau load Empty
+    omarchy-tableau save "Research"
+
+Design notes worth knowing before changing anything:
+
+* Windows are placed by driving Hyprland's dwindle layout rather than by
+  computing absolute rectangles: spawn a window, tell the layout where the
+  next split goes (`preselect`), spawn the next. Sizes are corrected once at
+  the end with an exact resize. This is why loading is sequential and why a
+  window that never maps aborts its workspace instead of silently skewing it.
+* Nothing is ever force-killed by default. Closing asks politely and reports
+  what refused, because an app refusing to close is usually an app with
+  unsaved work asking a question.
+* The arrangement chosen for a given set of monitors is remembered per
+  (setup, monitor fingerprint) in layouts.json, so the second time you plug
+  the same dock in you get the same desk back without re-deriving it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = Path(os.environ.get("OMARCHY_TABLEAU_CONFIG", HOME / ".config/omarchy/tableau.toml"))
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy/tableau"
+STATE_PATH = STATE_DIR / "state.json"
+LAYOUTS_PATH = STATE_DIR / "layouts.json"
+LOCK_PATH = STATE_DIR / "lock"
+LOG_PATH = STATE_DIR / "load.log"
+
+EMPTY = "Empty"  # the built-in do-nothing setup: a bare Omarchy desktop
+
+# App-id for the terminals we spawn. Deliberately *not* `org.omarchy.<cmd>`:
+# Omarchy floats and centres its own TUI app-ids -- the rule in
+# hypr/apps/system.lua matches `org.omarchy.btop|org.omarchy.terminal|...` in
+# full -- so a setup built under those ids came up as floating 875x600 boxes
+# instead of a tiled column. The extra `.setups.` misses that rule while still
+# matching `org.omarchy.*`, which is what tags a window as a terminal for
+# theming.
+APP_ID_PREFIX = "org.omarchy.tableau."
+
+# Terminals whose window is really "a shell running something". Used only when
+# reading the desktop back (save), never when building it.
+TERMINAL_CLASSES = {
+    "alacritty", "org.alacritty", "com.mitchellh.ghostty", "ghostty",
+    "foot", "footclient", "kitty", "org.wezfurlong.wezterm", "xterm",
+}
+
+DEFAULT_GRACE = 8          # seconds a window gets to close politely
+DEFAULT_WINDOW_WAIT = 20   # seconds a window gets to appear after launching
+LAYOUT_PLAN_VERSION = 2    # default monitor assignment changed to the main screen
+
+
+# --------------------------------------------------------------------------
+# hyprland
+# --------------------------------------------------------------------------
+
+def hyprctl(*args: str) -> str:
+    try:
+        r = subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def hypr_json(*args: str):
+    out = hyprctl(*args, "-j")
+    try:
+        return json.loads(out) if out else []
+    except json.JSONDecodeError:
+        return []
+
+
+def dispatch(lua: str) -> str:
+    return hyprctl("dispatch", lua)
+
+
+def hypr_eval(lua: str) -> str:
+    return hyprctl("eval", lua)
+
+
+def clients() -> list[dict]:
+    return hypr_json("clients")
+
+
+def monitors() -> list[dict]:
+    mons = [m for m in hypr_json("monitors") if not m.get("disabled")]
+    return sorted(mons, key=lambda m: (m.get("x", 0), m.get("y", 0)))
+
+
+def logical_size(mon: dict) -> tuple[int, int]:
+    w, h = int(mon.get("width", 0)), int(mon.get("height", 0))
+    if int(mon.get("transform", 0)) in (1, 3, 5, 7):
+        w, h = h, w
+    scale = float(mon.get("scale", 1) or 1)
+    return round(w / scale), round(h / scale)
+
+
+def fingerprint(mons: list[dict] | None = None) -> str:
+    """Stable id for "this set of screens, arranged like this"."""
+    mons = monitors() if mons is None else mons
+    parts = []
+    for m in mons:
+        w, h = logical_size(m)
+        parts.append(f"{m.get('description') or m.get('name')}@{w}x{h}")
+    raw = "|".join(sorted(parts))
+    return hashlib.sha1(raw.encode()).hexdigest()[:12] if parts else "none"
+
+
+def fingerprint_label(mons: list[dict] | None = None) -> str:
+    mons = monitors() if mons is None else mons
+    if not mons:
+        return "no screens"
+    bits = []
+    for m in mons:
+        w, h = logical_size(m)
+        bits.append(f"{m.get('name')} {w}×{h}")
+    return " + ".join(bits)
+
+
+# --------------------------------------------------------------------------
+# state
+# --------------------------------------------------------------------------
+
+def read_json(path: Path, fallback):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return fallback
+
+
+def write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def read_state() -> dict:
+    st = read_json(STATE_PATH, {})
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("setup", None)
+    st.setdefault("phase", "idle")
+    st.setdefault("step", "")
+    st.setdefault("error", "")
+    st.setdefault("blocked", [])
+    st.setdefault("services", [])
+    st.setdefault("progress", {"done": 0, "total": 0})
+    st.setdefault("loader_pid", 0)
+    phase = st.get("phase", "idle")
+    try:
+        pid = int(st.get("loader_pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if phase in ("loading", "unloading") and pid > 1:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            if time.time() - float(st.get("updated", 0) or 0) > 3:
+                st.update(phase="error", loader_pid=0,
+                          error="The previous setup load stopped unexpectedly")
+                write_json(STATE_PATH, st)
+    return st
+
+
+def save_state(**changes) -> dict:
+    st = read_state()
+    st.update(changes)
+    st["updated"] = time.time()
+    write_json(STATE_PATH, st)
+    return st
+
+
+def log(msg: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+class ConfigError(Exception):
+    pass
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {"options": {}, "setups": []}
+    try:
+        data = tomllib.loads(CONFIG_PATH.read_text())
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(str(e)) from e
+    except OSError as e:
+        raise ConfigError(str(e)) from e
+
+    setups = data.get("setups") or []
+    if not isinstance(setups, list):
+        raise ConfigError("`setups` must be a list of [[setups]] blocks")
+    for i, s in enumerate(setups):
+        if not isinstance(s, dict) or not s.get("name"):
+            raise ConfigError(f"setup #{i + 1} has no name")
+        names = [str(item.get("name", "")).strip().casefold() for item in setups
+                 if isinstance(item, dict)]
+        if len(names) != len(set(names)):
+            raise ConfigError("setup names must be unique")
+        workspaces = s.get("workspaces") or []
+        if not isinstance(workspaces, list):
+            raise ConfigError(f"{s['name']}: workspaces must be a list")
+        numbers = []
+        for w in workspaces:
+            if not isinstance(w, dict):
+                raise ConfigError(f"{s['name']}: every workspace must be a table")
+            try:
+                number = int(w.get("number") or 0)
+            except (TypeError, ValueError):
+                raise ConfigError(f"{s['name']}: workspace number must be an integer")
+            if number < 1 or number in numbers:
+                raise ConfigError(f"{s['name']}: workspace numbers must be unique positive integers")
+            numbers.append(number)
+            columns = w.get("columns") or []
+            if not isinstance(columns, list):
+                raise ConfigError(f"{s['name']}: columns must be a list")
+            for c in columns:
+                if not isinstance(c, dict):
+                    raise ConfigError(f"{s['name']}: every column must be a table")
+                windows = c.get("windows") or []
+                if not isinstance(windows, list):
+                    raise ConfigError(f"{s['name']}: windows must be a list")
+                for win in windows:
+                    if not isinstance(win, dict):
+                        raise ConfigError(f"{s['name']}: every window must be a table")
+                    if "term" not in win and "app" not in win:
+                        raise ConfigError(f"{s['name']}: a window needs `term` or `app`")
+        services = s.get("services") or []
+        if not isinstance(services, list):
+            raise ConfigError(f"{s['name']}: services must be a list")
+        for service in services:
+            if not isinstance(service, (str, dict)):
+                raise ConfigError(f"{s['name']}: every service must be a string or table")
+    data["options"] = data.get("options") or {}
+    data["setups"] = setups
+    return data
+
+
+def find_setup(cfg: dict, name: str) -> dict | None:
+    for s in cfg["setups"]:
+        if s["name"].lower() == name.lower():
+            return s
+    return None
+
+
+# --------------------------------------------------------------------------
+# layout resolution
+# --------------------------------------------------------------------------
+
+def max_columns(width: int) -> int:
+    """How many columns a screen this wide can carry before it stops helping."""
+    if width >= 2200:
+        return 4
+    if width >= 1500:
+        return 3
+    if width >= 1000:
+        return 2
+    return 1
+
+
+def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict:
+    """Decide which workspace lands on which screen, and how many columns.
+
+    Empty monitor preferences use the focused monitor (or the first monitor
+    when Hyprland has not reported one). An explicit monitor preference is
+    matched against both its connector name and description. A remembered
+    plan wins only when it uses the current assignment rules and every screen
+    it names is still here.
+    """
+    names = [m["name"] for m in mons]
+    if remembered and remembered.get("version") == LAYOUT_PLAN_VERSION:
+        wanted = {w.get("monitor") for w in remembered.get("workspaces", [])}
+        if wanted and wanted.issubset(set(names)):
+            return remembered
+
+    workspaces = setup.get("workspaces") or []
+    main = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
+    plan_ws = []
+    for i, ws in enumerate(workspaces):
+        # Do not distribute implicit workspaces: the main display is the
+        # predictable default. Use `monitor = "DP-2"` in the workspace block
+        # when a workspace belongs on another screen.
+        pref = ws.get("monitor")
+        mon = main
+        if pref:
+            mon = next((m for m in mons if pref.lower() in (m["name"] + " " + str(m.get("description", ""))).lower()), None)
+            mon = mon or main
+        mon_name = mon["name"] if mon else ""
+        width = logical_size(mon)[0] if mon else 1920
+        declared = len(ws.get("columns") or []) or 1
+        plan_ws.append({
+            "index": i,
+            "number": int(ws.get("number") or (i + 1)),
+            "monitor": mon_name,
+            "columns": max(1, min(declared, max_columns(width))),
+        })
+    return {"version": LAYOUT_PLAN_VERSION, "workspaces": plan_ws, "saved": time.time()}
+
+
+def remembered_plan(setup_name: str, fp: str) -> dict | None:
+    return (read_json(LAYOUTS_PATH, {}).get(fp) or {}).get(setup_name)
+
+
+def remember_plan(setup_name: str, fp: str, plan: dict) -> None:
+    all_plans = read_json(LAYOUTS_PATH, {})
+    all_plans.setdefault(fp, {})[setup_name] = plan
+    write_json(LAYOUTS_PATH, all_plans)
+
+
+def fold_columns(columns: list[dict], keep: int) -> list[dict]:
+    """Squeeze a wide arrangement onto a narrower screen.
+
+    Columns that do not fit are not dropped -- their windows are appended to
+    the last column that survived, stacked. Losing a window because a laptop
+    screen is small would be a worse surprise than a crowded column.
+    """
+    columns = [dict(c) for c in columns] or [{}]
+    if keep >= len(columns):
+        return columns
+    kept = columns[:keep]
+    tail = kept[-1]
+    tail["windows"] = list(tail.get("windows") or [])
+    for extra in columns[keep:]:
+        tail["windows"].extend(extra.get("windows") or [])
+    return kept
+
+
+# --------------------------------------------------------------------------
+# launching
+# --------------------------------------------------------------------------
+
+def has(cmd: str) -> bool:
+    return subprocess.run(["sh", "-c", f"command -v {shlex.quote(cmd)}"],
+                          capture_output=True).returncode == 0
+
+
+def launch_prefix() -> list[str]:
+    # uwsm-app puts the app in its own systemd scope, which is what every
+    # other Omarchy launcher does; without it the app inherits our cgroup and
+    # dies when the loader exits.
+    return ["setsid", "uwsm-app", "--"] if has("uwsm-app") else ["setsid"]
+
+
+def app_id_for(cmd: str) -> str:
+    """The app-id a terminal running `cmd` gets, when the setup names none."""
+    if not cmd:
+        return APP_ID_PREFIX + "terminal"
+    leaf = Path(shlex.split(cmd)[0]).name
+    return APP_ID_PREFIX + (re.sub(r"[^A-Za-z0-9_-]", "-", leaf) or "terminal")
+
+
+def spawn_window(win: dict) -> None:
+    workdir = os.path.expanduser(str(win.get("dir") or "")) or None
+    if workdir and not os.path.isdir(workdir):
+        workdir = None
+
+    if "term" in win:
+        cmd = str(win.get("term") or "").strip()
+        app_id = win.get("class") or app_id_for(cmd)
+        argv = [*launch_prefix(), "xdg-terminal-exec", f"--app-id={app_id}"]
+        if workdir:
+            argv.append(f"--dir={workdir}")
+        if cmd:
+            argv += ["-e", *shlex.split(cmd)]
+    else:
+        argv = [*launch_prefix(), *shlex.split(str(win["app"]))]
+
+    log(f"spawn: {' '.join(argv)}")
+    subprocess.Popen(argv, cwd=workdir, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def wait_for_window(before: set[str], timeout: float, want_class: str = "") -> dict | None:
+    """Wait for a window that was not there before.
+
+    Matching on "new address" rather than on pid is deliberate: apps launched
+    through uwsm/systemd, and every terminal that talks to a running server,
+    report a pid that has nothing to do with the window.
+    """
+    deadline = time.time() + timeout
+    fallback = None
+    while time.time() < deadline:
+        fresh = [c for c in clients() if c["address"] not in before]
+        for c in fresh:
+            if want_class and want_class.lower() not in c.get("class", "").lower():
+                fallback = fallback or c
+                continue
+            time.sleep(0.2)  # let it finish mapping before we measure it
+            return c
+        if fresh and not want_class:
+            time.sleep(0.2)
+            return fresh[0]
+        time.sleep(0.12)
+    return fallback
+
+
+# --------------------------------------------------------------------------
+# building a workspace
+# --------------------------------------------------------------------------
+
+def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str]:
+    number = ws_plan["number"]
+    monitor = ws_plan.get("monitor") or ""
+    columns = fold_columns(ws_cfg.get("columns") or [], ws_plan["columns"])
+
+    rule = f'hl.workspace_rule({{ workspace = "{number}", layout = "dwindle"'
+    if monitor:
+        rule += f', monitor = "{monitor}"'
+    rule += " })"
+    hypr_eval(rule)
+    dispatch(f'hl.dsp.focus({{ workspace = "{number}" }})')
+    time.sleep(0.15)
+
+    placed: list[list[dict]] = []   # [column][window] -> client
+    problems: list[str] = []
+
+    for ci, col in enumerate(columns):
+        wins = list(col.get("windows") or [])
+        if not wins:
+            continue
+        col_clients: list[dict] = []
+        for wi, win in enumerate(wins):
+            if wi == 0 and ci > 0 and placed:
+                anchor = placed[-1][0]
+                dispatch(f'hl.dsp.focus({{ window = "address:{anchor["address"]}" }})')
+                dispatch('hl.dsp.layout("preselect r")')
+            elif wi > 0:
+                anchor = col_clients[-1]
+                dispatch(f'hl.dsp.focus({{ window = "address:{anchor["address"]}" }})')
+                dispatch('hl.dsp.layout("preselect d")')
+
+            label = str(win.get("term") or win.get("app") or "terminal").split()[0]
+            report(f"workspace {number}: {label}")
+            before = {c["address"] for c in clients()}
+            spawn_window(win)
+            wait = float(win.get("wait") or opts.get("window_wait") or DEFAULT_WINDOW_WAIT)
+            client = wait_for_window(before, wait, str(win.get("class") or ""))
+            if client is None:
+                problems.append(f"{label} never opened")
+                log(f"timeout waiting for {label}")
+                continue
+            if client["workspace"]["id"] != number:
+                dispatch(f'hl.dsp.window.move({{ window = "address:{client["address"]}", '
+                         f'workspace = "{number}", follow = false }})')
+                time.sleep(0.15)
+            if client.get("floating") and not win.get("float"):
+                # Some window rule floats this class -- Omarchy does it for
+                # TUIs, 1Password, media players. In a setup that leaves a
+                # hole in the column, so put the window back in the layout.
+                # `float = true` on the window opts out and keeps it floating.
+                dispatch(f'hl.dsp.window.float({{ action = "off", '
+                         f'window = "address:{client["address"]}" }})')
+                time.sleep(0.2)
+                client = next((c for c in clients()
+                               if c["address"] == client["address"]), client)
+            col_clients.append(client)
+        if col_clients:
+            placed.append(col_clients)
+
+    if placed:
+        apply_sizes(number, columns, placed)
+    return problems
+
+
+def apply_sizes(number: int, columns: list[dict], placed: list[list[dict]]) -> None:
+    """Give every window its share of the workspace.
+
+    Sizes come from the area the windows actually ended up covering, not from
+    the monitor rectangle: that way gaps, the bar and any reserved space are
+    already accounted for and never have to be guessed at.
+    """
+    live = {c["address"]: c for c in clients() if c["workspace"]["id"] == number}
+    boxes = [live[c["address"]] for col in placed for c in col if c["address"] in live]
+    if len(boxes) < 2:
+        return
+
+    x0 = min(b["at"][0] for b in boxes)
+    y0 = min(b["at"][1] for b in boxes)
+    x1 = max(b["at"][0] + b["size"][0] for b in boxes)
+    y1 = max(b["at"][1] + b["size"][1] for b in boxes)
+
+    heads = [live.get(col[0]["address"]) for col in placed]
+    heads = [h for h in heads if h]
+    gap = 0
+    if len(heads) > 1:
+        ordered = sorted(heads, key=lambda h: h["at"][0])
+        gap = max(0, ordered[1]["at"][0] - (ordered[0]["at"][0] + ordered[0]["size"][0]))
+
+    weights = []
+    for ci, col in enumerate(columns[:len(placed)]):
+        try:
+            weights.append(max(0.1, float(col.get("width", 1) or 1)))
+        except (TypeError, ValueError):
+            weights.append(1.0)
+    total_w = sum(weights) or 1.0
+    content_w = (x1 - x0) - gap * (len(placed) - 1)
+
+    def min_width(col: dict) -> int:
+        """Return a practical minimum width for a column's content.
+
+        TUI programs measure their terminal in character cells.  A btop pane
+        at 79 columns shows a red warning instead of a useful dashboard, so
+        give columns containing it first claim on enough logical pixels.
+        """
+        specs = list(col.get("windows") or [])
+        if any(str(spec.get("term") or "").strip().lower() == "btop" for spec in specs):
+            return 700
+        if any("term" in spec for spec in specs):
+            return 520
+        return 320
+
+    def column_widths() -> list[int]:
+        minimums = [min_width(col) for col in columns[:len(placed)]]
+        widths = [content_w * weight / total_w for weight in weights]
+        if content_w >= sum(minimums):
+            fixed = [False] * len(widths)
+            while True:
+                changed = False
+                free = content_w - sum(minimums[i] for i, locked in enumerate(fixed) if locked)
+                free_weight = sum(weights[i] for i, locked in enumerate(fixed) if not locked)
+                for i in range(len(widths)):
+                    if fixed[i]:
+                        widths[i] = minimums[i]
+                    elif widths[i] < minimums[i]:
+                        fixed[i] = True
+                        widths[i] = minimums[i]
+                        changed = True
+                    else:
+                        widths[i] = free * weights[i] / (free_weight or 1.0)
+                if not changed:
+                    break
+        result = [max(60, round(width)) for width in widths]
+        if result:
+            result[-1] += round(content_w) - sum(result)
+        return result
+
+    target_widths = column_widths()
+
+    def min_height(spec: dict) -> int:
+        """Return a practical minimum for a pane's content.
+
+        TUI programs do not get a useful chance to explain that they are too
+        short: they simply render clipped panels.  Keep btop comfortably
+        above its compact/overflow states on every monitor.  The value is in
+        logical Hyprland pixels, so it follows monitor scale automatically.
+        """
+        if str(spec.get("term") or "").strip().lower() == "btop":
+            return 460
+        if "term" in spec:
+            return 240
+        return 180
+
+    def row_heights(col: dict, count: int, available: int) -> list[int]:
+        specs = list(col.get("windows") or [])[:count]
+        weights = []
+        minimums = []
+        for spec in specs:
+            raw = spec.get("height", 1)
+            try:
+                weights.append(max(0.1, float(raw or 1)))
+            except (TypeError, ValueError):
+                weights.append(1.0)
+            minimums.append(min_height(spec))
+
+        # Honor configured proportions when they fit, but promote a pane
+        # whose content would otherwise be clipped.  If the monitor is too
+        # short for all minima, preserve the important TUI pane first and
+        # compress the other rows to the remaining space.
+        total_weight = sum(weights) or 1.0
+        heights = [available * weight / total_weight for weight in weights]
+        if available >= sum(minimums):
+            fixed = [False] * len(heights)
+            while True:
+                changed = False
+                free = available - sum(minimums[i] for i, locked in enumerate(fixed) if locked)
+                free_weight = sum(weights[i] for i, locked in enumerate(fixed) if not locked)
+                for i in range(len(heights)):
+                    if fixed[i]:
+                        heights[i] = minimums[i]
+                    elif heights[i] < minimums[i]:
+                        fixed[i] = True
+                        heights[i] = minimums[i]
+                        changed = True
+                    else:
+                        heights[i] = free * weights[i] / (free_weight or 1.0)
+                if not changed:
+                    break
+        else:
+            # On a very short display, btop gets first claim on space and
+            # other panes use the rest.  Never create a negative/zero pane.
+            heights = [max(60, available * weight / total_weight) for weight in weights]
+            for i, spec in enumerate(specs):
+                if str(spec.get("term") or "").strip().lower() == "btop":
+                    heights[i] = max(60, available - sum(heights[j] for j in range(len(heights)) if j != i))
+                    break
+
+        result = [max(60, round(h)) for h in heights]
+        if result:
+            result[-1] += available - sum(result)
+        return result
+
+    for ci, col_clients in enumerate(placed):
+        col_w = target_widths[ci]
+        content_h = (y1 - y0) - gap * (len(col_clients) - 1)
+        target_heights = row_heights(columns[ci], len(col_clients), content_h)
+
+        for wi, c in enumerate(col_clients):
+            cur = live.get(c["address"])
+            if not cur:
+                continue
+            # Size the final column/row too.  Leaving either at its dwindle
+            # default was the source of undersized bottom-right btop panes.
+            target_w = col_w
+            target_h = target_heights[wi]
+            if target_w < 60 or target_h < 60:
+                continue
+            dispatch(f'hl.dsp.window.resize({{ x = {int(target_w)}, y = {int(target_h)}, '
+                     f'window = "address:{c["address"]}" }})')
+            time.sleep(0.08)
+            live = {c2["address"]: c2 for c2 in clients() if c2["workspace"]["id"] == number}
+
+
+# --------------------------------------------------------------------------
+# services
+# --------------------------------------------------------------------------
+
+def normalize_service(spec) -> dict:
+    if isinstance(spec, str):
+        s = spec.strip()
+        if re.fullmatch(r"[\w@.\\-]+\.(service|socket|target|timer|scope|path)", s) or user_unit_exists(s):
+            return {"unit": s}
+        return {"run": s}
+    return dict(spec or {})
+
+
+def user_unit_exists(name: str) -> bool:
+    unit = name if "." in name else f"{name}.service"
+    r = subprocess.run(["systemctl", "--user", "list-unit-files", unit],
+                       capture_output=True, text=True)
+    return unit in r.stdout
+
+
+def user_unit_active(unit: str) -> bool:
+    """Whether a user unit was already active before Tableau touched it."""
+    r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def start_services(specs: list, report) -> list[dict]:
+    started = []
+    for raw in specs or []:
+        spec = normalize_service(raw)
+        if spec.get("unit"):
+            unit = spec["unit"] if "." in spec["unit"] else f"{spec['unit']}.service"
+            already_active = user_unit_active(unit)
+            report(f"{unit} already running" if already_active else f"starting {unit}")
+            if already_active:
+                started.append({"unit": unit, "ok": True, "owned": False,
+                                "already_active": True})
+                continue
+            r = subprocess.run(["systemctl", "--user", "start", unit],
+                               capture_output=True, text=True)
+            log(f"systemctl --user start {unit}: rc={r.returncode} {r.stderr.strip()}")
+            started.append({"unit": unit, "ok": r.returncode == 0,
+                            "owned": r.returncode == 0, "error": r.stderr.strip()})
+        elif spec.get("run"):
+            workdir = os.path.expanduser(str(spec.get("dir") or "")) or None
+            if workdir and not os.path.isdir(workdir):
+                workdir = None
+            label = str(spec["run"]).split()[0] if str(spec["run"]).split() else "service"
+            report(f"starting {label}")
+            p = subprocess.Popen(["bash", "-lc", spec["run"]], cwd=workdir,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            log(f"run service pid={p.pid}: {spec['run']}")
+            started.append({"run": spec["run"], "pid": p.pid, "stop": spec.get("stop", ""),
+                            "dir": spec.get("dir", ""), "ok": True, "owned": True})
+    return started
+
+
+def stop_services(started: list[dict], report) -> None:
+    for spec in reversed(started or []):
+        if spec.get("unit") and spec.get("owned") is True:
+            report(f"stopping {spec['unit']}")
+            subprocess.run(["systemctl", "--user", "stop", spec["unit"]],
+                           capture_output=True, text=True)
+        elif spec.get("unit"):
+            # The unit was already running before this setup was loaded.
+            # Never stop another application or setup's service.
+            continue
+        elif spec.get("stop"):
+            report("stopping service")
+            subprocess.run(["bash", "-lc", spec["stop"]],
+                           cwd=os.path.expanduser(str(spec.get("dir") or "")) or None,
+                           capture_output=True)
+        elif spec.get("pid"):
+            report("stopping service")
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(os.getpgid(int(spec["pid"])), sig)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    break
+                time.sleep(0.6)
+                try:
+                    os.kill(int(spec["pid"]), 0)
+                except OSError:
+                    break
+
+
+# --------------------------------------------------------------------------
+# teardown
+# --------------------------------------------------------------------------
+
+def describe(c: dict) -> str:
+    title = (c.get("title") or "").strip()
+    cls = (c.get("class") or "window").strip()
+    return f"{cls} — {title}" if title and title.lower() != cls.lower() else cls
+
+
+def close_windows(grace: float, force: bool, report) -> list[dict]:
+    """Ask every window to close; return the ones that refused."""
+    targets = [c for c in clients() if c.get("mapped", True)]
+    if not targets:
+        return []
+    report(f"closing {len(targets)} window{'s' if len(targets) != 1 else ''}")
+    for c in targets:
+        dispatch(f'hl.dsp.window.close({{ window = "address:{c["address"]}" }})')
+
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        left = [c for c in clients() if c.get("mapped", True)]
+        if not left:
+            return []
+        time.sleep(0.25)
+
+    left = [c for c in clients() if c.get("mapped", True)]
+    if not left or not force:
+        return left
+
+    report("forcing the rest closed")
+    for c in left:
+        pid = c.get("pid") or 0
+        if pid > 1:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    time.sleep(2.0)
+    for c in [c for c in clients() if c.get("mapped", True)]:
+        pid = c.get("pid") or 0
+        if pid > 1:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    time.sleep(0.8)
+    return [c for c in clients() if c.get("mapped", True)]
+
+
+# --------------------------------------------------------------------------
+# load / unload
+# --------------------------------------------------------------------------
+
+def acquire_lock() -> bool:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as lock:
+                lock.write(str(os.getpid()))
+            return True
+        except FileExistsError:
+            try:
+                old = int(LOCK_PATH.read_text().strip())
+                os.kill(old, 0)
+                return False
+            except (OSError, ValueError):
+                try:
+                    LOCK_PATH.unlink()
+                except FileNotFoundError:
+                    pass
+    return False
+
+
+def release_lock() -> None:
+    try:
+        if LOCK_PATH.read_text().strip() == str(os.getpid()):
+            LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+# The id of the toast the current load owns, so every later message replaces
+# it instead of stacking a new one per window.
+_toast = {"id": 0}
+
+
+def notify(title: str, body: str = "", *, replace: bool = False,
+           sticky: bool = False, urgency: str = "low") -> None:
+    """Show, or rewrite, the notification that belongs to this load.
+
+    A switch takes tens of seconds and closes every window on the way, so
+    for most of it the toast and the bar are the only things on screen. It
+    is opened when the switch starts, rewritten in place as each window
+    appears (`-r` replaces, `-p` hands back the id), and finally replaced by
+    the result -- which is the first message allowed to time out.
+    """
+    if not has("omarchy-notification-send"):
+        return
+    argv = ["omarchy-notification-send", "-g", "\U000f0765", "-u", urgency, "-p"]
+    if sticky:
+        argv += ["-t", "0"]          # stays up until the next message replaces it
+    if replace and _toast["id"]:
+        argv += ["-r", str(_toast["id"])]
+    argv += [title, body]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    if out.isdigit():
+        _toast["id"] = int(out)
+
+
+def cmd_load(args) -> int:
+    name = args.name
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        save_state(phase="error", error=f"tableau.toml: {e}", step="")
+        print(f"config error: {e}", file=sys.stderr)
+        return 1
+
+    setup = None
+    if name.lower() != EMPTY.lower():
+        setup = find_setup(cfg, name)
+        if setup is None:
+            save_state(phase="error", error=f"No setup named “{name}”")
+            print(f"no setup named {name!r}", file=sys.stderr)
+            return 1
+        name = setup["name"]
+    else:
+        name = EMPTY
+
+    if not acquire_lock():
+        print("another load is already running", file=sys.stderr)
+        return 1
+
+    opts = cfg.get("options") or {}
+    grace = float(setup.get("grace") if setup and setup.get("grace") else opts.get("grace") or DEFAULT_GRACE)
+    prev = read_state()
+
+    head = "Emptying the desktop" if setup is None else f"Loading {name}"
+
+    def report(step: str) -> None:
+        save_state(step=step)
+        log(step)
+        notify(head, step, replace=True, sticky=True)
+
+    try:
+        notify(head, "closing the current desk", sticky=True)
+        # --- tear the old desk down -----------------------------------------
+        save_state(phase="unloading", loader_pid=os.getpid(), step="saving and closing", error="", blocked=[],
+                   progress={"done": 0, "total": 0})
+        # Windows first, services second. A switch that stalls on an unsaved
+        # document should leave the desk exactly as it was -- including the
+        # database the old setup started.
+        blocked = close_windows(grace, args.force, report)
+        if blocked:
+            save_state(phase="blocked", loader_pid=0, step="",
+                       blocked=[{"class": c.get("class", ""), "title": c.get("title", ""),
+                                 "address": c["address"]} for c in blocked],
+                       error="Some windows would not close — they may be asking to save.")
+            notify("Setup switch paused",
+                   f"{len(blocked)} window(s) refused to close — they may be asking to save",
+                   replace=True, urgency="normal")
+            return 2
+
+        stop_services(prev.get("services") or [], report)
+
+        if setup is None:
+            dispatch('hl.dsp.focus({ workspace = "1" })')
+            save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="", blocked=[], services=[],
+                       fingerprint=fingerprint(), progress={"done": 0, "total": 0})
+            notify("Empty desktop", "everything closed", replace=True)
+            return 0
+
+        # --- build the new one ----------------------------------------------
+        mons = monitors()
+        fp = fingerprint(mons)
+        plan = resolve_plan(setup, mons, remembered_plan(setup["name"], fp))
+        remember_plan(setup["name"], fp, plan)
+
+        workspaces = setup.get("workspaces") or []
+        total = sum(len(c.get("windows") or []) for ws in workspaces for c in (ws.get("columns") or []))
+        save_state(phase="loading", setup=setup["name"], fingerprint=fp,
+                   progress={"done": 0, "total": total}, error="", blocked=[])
+
+        services = start_services(setup.get("services") or [], report)
+        failed_services = [s for s in services if not s.get("ok", True)]
+        if failed_services:
+            names = ", ".join(s.get("unit") or s.get("run", "service") for s in failed_services)
+            stop_services([s for s in services if s not in failed_services], report)
+            save_state(phase="error", loader_pid=0, error=f"Could not start: {names}", services=services)
+            notify("Setup switch failed", f"Could not start: {names}", replace=True, urgency="critical")
+            return 1
+        save_state(services=services)
+
+        done = [0]
+
+        def step_report(step: str) -> None:
+            done[0] += 1
+            save_state(step=step, progress={"done": done[0], "total": total})
+            log(step)
+            notify(f"{head} — {done[0]}/{total}", step, replace=True, sticky=True)
+
+        problems: list[str] = []
+        for ws_plan in plan["workspaces"]:
+            idx = ws_plan["index"]
+            if idx >= len(workspaces):
+                continue
+            problems += build_workspace(workspaces[idx], ws_plan, opts, step_report)
+
+        focus_ws = setup.get("focus")
+        if focus_ws:
+            dispatch(f'hl.dsp.focus({{ workspace = "{int(focus_ws)}" }})')
+        elif plan["workspaces"]:
+            # End on the first workspace of each screen, finishing on the first
+            # screen -- so the desk you look at is the one you asked for.
+            seen = set()
+            for ws_plan in reversed(plan["workspaces"]):
+                if ws_plan["monitor"] in seen:
+                    continue
+                seen.add(ws_plan["monitor"])
+                dispatch(f'hl.dsp.focus({{ workspace = "{ws_plan["number"]}" }})')
+
+        failed = "; ".join(problems)
+        save_state(phase="idle", loader_pid=0, step="", error=failed, blocked=[],
+                   progress={"done": total, "total": total})
+        loaded_body = failed or (f"{total} window{'s' if total != 1 else ''} across "
+                                 f"{len(plan['workspaces'])} workspace"
+                                 f"{'s' if len(plan['workspaces']) != 1 else ''}")
+        notify(f"{setup['name']} loaded", loaded_body, replace=True,
+               urgency="normal" if failed else "low")
+        return 0
+    except Exception as e:  # never leave the panel stuck on "loading"
+        log(f"FATAL {e!r}")
+        save_state(phase="error", loader_pid=0, step="", error=str(e))
+        notify("Setup switch failed", str(e), replace=True, urgency="critical")
+        return 1
+    finally:
+        release_lock()
+
+
+# --------------------------------------------------------------------------
+# save current state
+# --------------------------------------------------------------------------
+
+def proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [p for p in raw.decode(errors="replace").split("\0") if p]
+
+
+def proc_cwd(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def child_pids(pid: int) -> list[int]:
+    try:
+        raw = Path(f"/proc/{pid}/task/{pid}/children").read_text()
+    except OSError:
+        return []
+    return [int(p) for p in raw.split()]
+
+
+def deepest_command(pid: int) -> tuple[list[str], int]:
+    """Follow a terminal's children down to whatever is actually running."""
+    best_argv, best_pid = proc_cmdline(pid), pid
+    seen = 0
+    cur = pid
+    while seen < 8:
+        kids = child_pids(cur)
+        if not kids:
+            break
+        cur = kids[-1]
+        argv = proc_cmdline(cur)
+        if argv:
+            best_argv, best_pid = argv, cur
+        seen += 1
+    return best_argv, best_pid
+
+
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "nu", "login"}
+
+# Terminal *binaries*. Detecting on the executable rather than on the window
+# class is what makes reading a desktop back work at all: a terminal running
+# btop usually carries the class `org.omarchy.btop`, which looks nothing like
+# a terminal from the outside.
+TERMINAL_EXES = {
+    "ghostty", "alacritty", "foot", "footclient", "kitty", "wezterm",
+    "wezterm-gui", "xterm", "konsole", "gnome-terminal", "gnome-terminal-server",
+}
+
+
+def proc_exe(pid: int) -> str:
+    try:
+        return Path(os.readlink(f"/proc/{pid}/exe")).name
+    except OSError:
+        return ""
+
+
+def is_terminal_window(c: dict, argv: list[str]) -> bool:
+    cls = (c.get("class") or "").lower()
+    exe = proc_exe(int(c.get("pid") or 0))
+    argv0 = Path(argv[0]).name if argv else ""
+    return (exe in TERMINAL_EXES or argv0 in TERMINAL_EXES
+            or cls in TERMINAL_CLASSES or cls.startswith("org.omarchy."))
+
+
+def terminal_spec(c: dict, argv: list[str]) -> dict:
+    """Recover "a terminal running X in Y" from a terminal's command line."""
+    pid = int(c.get("pid") or 0)
+    spec: dict = {}
+    cmd = ""
+    workdir = ""
+
+    for i, a in enumerate(argv):
+        if a in ("-e", "--command", "-e--"):
+            cmd = " ".join(argv[i + 1:])
+            break
+        if a.startswith("--command="):
+            cmd = a.split("=", 1)[1]
+            break
+    for a in argv:
+        if a.startswith(("--working-directory=", "--dir=", "--cwd=")):
+            workdir = a.split("=", 1)[1]
+
+    if not cmd and pid > 1:
+        # Nothing was passed with -e, so whatever is running was started
+        # inside the shell. Only trust this when the descent is unambiguous;
+        # a terminal that multiplexes windows in one process would otherwise
+        # hand us a command from someone else's window.
+        kids = child_pids(pid)
+        if len(kids) == 1:
+            leaf_argv, leaf_pid = deepest_command(pid)
+            name = Path(leaf_argv[0]).name if leaf_argv else ""
+            if name and name not in SHELLS and name not in TERMINAL_EXES:
+                cmd = " ".join(leaf_argv)
+            workdir = workdir or proc_cwd(leaf_pid)
+
+    spec["term"] = cmd
+    workdir = workdir or proc_cwd(pid)
+    if workdir and workdir != str(HOME) and os.path.isdir(workdir):
+        spec["dir"] = workdir.replace(str(HOME), "~", 1)
+
+    # Keep the app-id only when it is not the one we would generate anyway,
+    # so hand-written setups stay readable.
+    cls = c.get("class") or ""
+    default_cls = app_id_for(cmd)
+    if cls and cls != default_cls and not cls.lower() in TERMINAL_CLASSES:
+        spec["class"] = cls
+    return spec
+
+
+def window_to_spec(c: dict) -> dict:
+    pid = int(c.get("pid") or 0)
+    argv = proc_cmdline(pid) if pid > 1 else []
+    if is_terminal_window(c, argv):
+        return terminal_spec(c, argv)
+    if argv:
+        return {"app": " ".join(argv), "class": c.get("class") or ""}
+    return {"app": c.get("class") or "", "class": c.get("class") or ""}
+
+
+def nice_weights(sizes: list[int]) -> list[int]:
+    """Turn measured pixel sizes into the small whole numbers a human wrote.
+
+    A 2/3 + 1/3 split should read back as `width = 2` and `width = 1`, not as
+    1255 and 627. Anything that does not land close to a simple ratio falls
+    back to equal weights, which is the honest answer for a messy desk.
+    """
+    total = sum(sizes) or 1
+    fractions = [s / total for s in sizes]
+    for d in range(1, 9):
+        cand = [max(1, round(f * d)) for f in fractions]
+        if sum(cand) == 0:
+            continue
+        got = [c / sum(cand) for c in cand]
+        if all(abs(g - f) < 0.06 for g, f in zip(got, fractions)):
+            return cand
+    return [1] * len(sizes)
+
+
+def snapshot() -> list[dict]:
+    """Read the current desktop back as workspace/column/window structure."""
+    by_ws: dict[int, list[dict]] = {}
+    for c in clients():
+        if not c.get("mapped", True) or c.get("floating"):
+            continue
+        wid = c["workspace"]["id"]
+        if wid < 1:  # special workspaces are not part of a setup
+            continue
+        by_ws.setdefault(wid, []).append(c)
+
+    workspaces = []
+    for wid in sorted(by_ws):
+        wins = sorted(by_ws[wid], key=lambda c: (c["at"][0], c["at"][1]))
+        columns: list[list[dict]] = []
+        for c in wins:
+            placed = False
+            for col in columns:
+                ref = col[0]
+                # Same column when the horizontal spans mostly overlap.
+                a0, a1 = c["at"][0], c["at"][0] + c["size"][0]
+                b0, b1 = ref["at"][0], ref["at"][0] + ref["size"][0]
+                overlap = max(0, min(a1, b1) - max(a0, b0))
+                if overlap > 0.6 * min(a1 - a0, b1 - b0):
+                    col.append(c)
+                    placed = True
+                    break
+            if not placed:
+                columns.append([c])
+        col_weights = nice_weights([col[0]["size"][0] for col in columns])
+        out_cols = []
+        for col, cw in zip(columns, col_weights):
+            col = sorted(col, key=lambda c: c["at"][1])
+            hws = nice_weights([c["size"][1] for c in col])
+            out_wins = []
+            for c, hw in zip(col, hws):
+                spec = window_to_spec(c)
+                if hw != 1 or len(col) > 1:
+                    spec["height"] = hw
+                out_wins.append(spec)
+            out_cols.append({"width": cw, "windows": out_wins})
+        workspaces.append({"number": wid, "columns": out_cols})
+    return workspaces
+
+
+def toml_inline(value) -> str:
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_inline(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{k} = {toml_inline(v)}" for k, v in value.items()) + " }"
+    return json.dumps(str(value))
+
+
+def render_setup(name: str, workspaces: list[dict], services: list, icon: str = "") -> str:
+    lines = ["[[setups]]", f'name = {json.dumps(name)}']
+    if icon:
+        lines.append(f"icon = {json.dumps(icon)}")
+    if services:
+        lines.append(f"services = {toml_inline(services)}")
+    for ws in workspaces:
+        lines.append("")
+        lines.append("  [[setups.workspaces]]")
+        lines.append(f"  number = {ws['number']}")
+        lines.append("  columns = [")
+        for col in ws["columns"]:
+            lines.append(f"    {toml_inline(col)},")
+        lines.append("  ]")
+    return "\n".join(lines) + "\n"
+
+
+def replace_setup_block(text: str, name: str, block: str) -> str:
+    """Swap one [[setups]] block in place, leaving every comment around it."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, l in enumerate(lines) if l.strip() == "[[setups]]"]
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(lines)
+        chunk = "".join(lines[start:end])
+        m = re.search(r'^\s*name\s*=\s*"([^"]*)"', chunk, re.M)
+        if m and m.group(1).lower() == name.lower():
+            return "".join(lines[:start]) + block + "\n" + "".join(lines[end:])
+    sep = "" if text.endswith("\n\n") or not text.strip() else "\n"
+    return text + sep + "\n" + block
+
+
+def config_backup_and_write(text: str) -> None:
+    if CONFIG_PATH.exists():
+        CONFIG_PATH.with_name(CONFIG_PATH.name + f".bak.{time.time_ns()}").write_text(text)
+    write_text_atomic(CONFIG_PATH, text)
+
+
+def setup_block(text: str, name: str) -> str | None:
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.strip() == "[[setups]]"]
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(lines)
+        chunk = "".join(lines[start:end])
+        m = re.search(r'^\s*name\s*=\s*(["\'])(.*?)\1', chunk, re.M)
+        if m and m.group(2).casefold() == name.casefold():
+            return chunk
+    return None
+
+
+def cmd_delete(args) -> int:
+    name = args.name.strip()
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr); return 1
+    if not find_setup(cfg, name):
+        print(f"no setup named {name!r}", file=sys.stderr); return 1
+    text = CONFIG_PATH.read_text()
+    block = setup_block(text, name)
+    if block is None:
+        print("could not locate setup block", file=sys.stderr); return 1
+    config_backup_and_write(text.replace(block, "", 1).lstrip("\n"))
+    plans = read_json(LAYOUTS_PATH, {})
+    for group in plans.values(): group.pop(name, None)
+    write_json(LAYOUTS_PATH, plans)
+    if str(read_state().get("setup") or "").casefold() == name.casefold():
+        save_state(setup=EMPTY, phase="idle", error="")
+    notify(f"Deleted “{name}”")
+    return 0
+
+
+def cmd_rename(args) -> int:
+    old, new = args.old.strip(), args.new.strip()
+    if not old or not new or new.casefold() == EMPTY.casefold():
+        print("invalid setup name", file=sys.stderr); return 1
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr); return 1
+    if not find_setup(cfg, old) or find_setup(cfg, new):
+        print("source missing or destination already exists", file=sys.stderr); return 1
+    text = CONFIG_PATH.read_text(); block = setup_block(text, old)
+    if block is None: return 1
+    renamed = re.sub(r'^(\s*name\s*=\s*)(["\']).*?\2',
+                     lambda m: m.group(1) + json.dumps(new), block, count=1, flags=re.M)
+    config_backup_and_write(text.replace(block, renamed, 1))
+    plans = read_json(LAYOUTS_PATH, {})
+    for group in plans.values():
+        if old in group: group[new] = group.pop(old)
+    write_json(LAYOUTS_PATH, plans)
+    if str(read_state().get("setup") or "").casefold() == old.casefold(): save_state(setup=new)
+    notify(f"Renamed to “{new}”")
+    return 0
+
+
+def cmd_duplicate(args) -> int:
+    source, new = args.source.strip(), args.new.strip()
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr); return 1
+    if not find_setup(cfg, source) or find_setup(cfg, new):
+        print("source missing or destination already exists", file=sys.stderr); return 1
+    text = CONFIG_PATH.read_text(); block = setup_block(text, source)
+    if block is None: return 1
+    copy = re.sub(r'^(\s*name\s*=\s*)(["\']).*?\2',
+                  lambda m: m.group(1) + json.dumps(new), block, count=1, flags=re.M)
+    config_backup_and_write(text.rstrip() + "\n\n" + copy.lstrip())
+    notify(f"Duplicated as “{new}”")
+    return 0
+
+
+def cmd_save(args) -> int:
+    name = args.name.strip()
+    if not name or name.lower() == EMPTY.lower():
+        print(f"{EMPTY!r} is reserved", file=sys.stderr)
+        return 1
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 1
+
+    workspaces = snapshot()
+    if not workspaces:
+        print("nothing open to save", file=sys.stderr)
+        save_state(error="Nothing open to save")
+        return 1
+
+    existing = find_setup(cfg, name)
+    # Services are not detectable from the desktop; keep whatever the setup
+    # already declared rather than silently dropping them.
+    services = (existing or {}).get("services") or []
+    icon = (existing or {}).get("icon") or ""
+
+    block = render_setup(name, workspaces, services, icon)
+    if CONFIG_PATH.exists():
+        text = CONFIG_PATH.read_text()
+    else:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        text = STARTER_HEADER
+    if CONFIG_PATH.exists():
+        backup = CONFIG_PATH.with_name(CONFIG_PATH.name + f".bak.{time.time_ns()}")
+        backup.write_text(text)
+    write_text_atomic(CONFIG_PATH, replace_setup_block(text, name, block))
+
+    fp = fingerprint()
+    plan = {"workspaces": [{"index": i, "number": ws["number"],
+                            "monitor": monitor_of_workspace(ws["number"]),
+                            "columns": len(ws["columns"])}
+                           for i, ws in enumerate(workspaces)],
+            "saved": time.time()}
+    remember_plan(name, fp, plan)
+    save_state(setup=name, phase="idle", step="", error="")
+    notify(f"Saved “{name}”", f"{len(workspaces)} workspace(s)")
+    print(f"saved {name!r} to {CONFIG_PATH}")
+    return 0
+
+
+def monitor_of_workspace(number: int) -> str:
+    for ws in hypr_json("workspaces"):
+        if ws.get("id") == number:
+            return ws.get("monitor", "")
+    return ""
+
+
+# --------------------------------------------------------------------------
+# status / init / edit
+# --------------------------------------------------------------------------
+
+def weight_of(raw) -> float:
+    try:
+        return max(0.1, float(raw or 1))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def window_label(win: dict) -> str:
+    """The one word that names a window in the menu: `codex`, `chromium`."""
+    if "app" in win:
+        raw = str(win.get("app") or "")
+        return Path(shlex.split(raw)[0]).name if raw.strip() else "app"
+    cmd = str(win.get("term") or "").strip()
+    return Path(shlex.split(cmd)[0]).name if cmd else "shell"
+
+
+def setup_shape(setup: dict) -> tuple[list, int]:
+    """The setup as the panel draws it: workspaces of columns of weights.
+
+    Only the shape the config asks for -- what a screen this narrow actually
+    does with it is decided at load time by resolve_plan.
+    """
+    shape = []
+    windows = 0
+    for ws in setup.get("workspaces") or []:
+        cols = []
+        for col in ws.get("columns") or []:
+            wins = list(col.get("windows") or [])
+            windows += len(wins)
+            cols.append({
+                "w": weight_of(col.get("width")),
+                "h": [weight_of(w.get("height")) for w in wins],
+                "labels": [window_label(w) for w in wins],
+            })
+        shape.append({"number": ws.get("number"), "columns": cols})
+    return shape, windows
+
+
+def cmd_status(args) -> int:
+    st = read_state()
+    err = ""
+    setups = []
+    try:
+        cfg = load_config()
+        for s in cfg["setups"]:
+            shape, windows = setup_shape(s)
+            setups.append({
+                "name": s["name"],
+                "icon": s.get("icon", ""),
+                "workspaces": len(s.get("workspaces") or []),
+                "services": len(s.get("services") or []),
+                "windows": windows,
+                "layout": shape,
+            })
+    except ConfigError as e:
+        err = str(e)
+
+    mons = monitors()
+    payload = {
+        "setups": setups,
+        "current": st.get("setup") or EMPTY,
+        "phase": st.get("phase", "idle"),
+        "step": st.get("step", ""),
+        "progress": st.get("progress", {"done": 0, "total": 0}),
+        "error": st.get("error", ""),
+        "blocked": st.get("blocked", []),
+        "configError": err,
+        "configPath": str(CONFIG_PATH),
+        "configExists": CONFIG_PATH.exists(),
+        "screens": fingerprint_label(mons),
+        "fingerprint": fingerprint(mons),
+        "known": bool(remembered_plan(st.get("setup") or "", fingerprint(mons))),
+        "empty": EMPTY,
+    }
+    if args.json:
+        print(json.dumps(payload))
+    else:
+        print(f"current : {payload['current']}")
+        print(f"phase   : {payload['phase']} {payload['step']}")
+        print(f"screens : {payload['screens']}")
+        print(f"setups  : {', '.join(s['name'] for s in setups) or '(none)'}")
+        if err:
+            print(f"config  : ERROR {err}")
+    return 0
+
+
+STARTER_HEADER = """# Omarchy setups -- one block per project, loaded from the bar.
+#
+# A setup is workspaces, each workspace is columns, each column is windows.
+# Widths and heights are relative weights, not pixels: `width = 2` next to
+# `width = 1` means two thirds and one third, on whatever screen it lands on.
+#
+#   term = "btop"      run this in a terminal ("" = a plain shell)
+#   app  = "chromium"  run this as an app (full command line)
+#   dir  = "~/Work"    working directory
+#   class = "chromium" window class, when it differs from the command
+#
+# Setups load only when you pick one from the bar. Nothing runs at login.
+
+[options]
+grace = 8          # seconds a window gets to close politely before we give up
+"""
+
+
+STARTER_BODY = """
+[[setups]]
+name = "Work"
+icon = ""
+# Systemd user units, or plain commands to run in the background.
+# services = ["docker-desktop", { run = "npm run dev", dir = "~/Work/app", stop = "pkill -f 'npm run dev'" }]
+services = []
+
+  [[setups.workspaces]]
+  number = 1
+  columns = [
+    { width = 2, windows = [{ term = "" }] },
+    { width = 1, windows = [{ term = "btop" }] },
+  ]
+
+  [[setups.workspaces]]
+  number = 2
+  columns = [
+    { width = 1, windows = [{ app = "omarchy-launch-browser" }] },
+    { width = 1, windows = [{ app = "nautilus" }] },
+  ]
+
+[[setups]]
+name = "Browse"
+icon = ""
+services = []
+
+  [[setups.workspaces]]
+  number = 1
+  columns = [
+    { width = 2, windows = [{ app = "omarchy-launch-browser" }] },
+    { width = 1, windows = [
+      { term = "", height = 2 },
+      { term = "btop", height = 1 },
+    ] },
+  ]
+
+  [[setups.workspaces]]
+  number = 2
+  columns = [
+    { width = 1, windows = [{ app = "nautilus" }] },
+    { width = 1, windows = [
+      { term = "", height = 1 },
+      { term = "btop", height = 1 },
+    ] },
+  ]
+"""
+
+
+def cmd_init(args) -> int:
+    if CONFIG_PATH.exists() and not args.force:
+        print(f"{CONFIG_PATH} already exists")
+        return 0
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(STARTER_HEADER + STARTER_BODY)
+    print(f"wrote {CONFIG_PATH}")
+    return 0
+
+
+def cmd_edit(args) -> int:
+    if not CONFIG_PATH.exists():
+        cmd_init(argparse.Namespace(force=False))
+    if has("omarchy-launch-editor"):
+        subprocess.Popen(["setsid", "omarchy-launch-editor", str(CONFIG_PATH)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    else:
+        editor = os.environ.get("EDITOR", "nvim")
+        subprocess.Popen([*launch_prefix(), "xdg-terminal-exec", "-e", editor, str(CONFIG_PATH)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    return 0
+
+
+def cmd_forget(args) -> int:
+    """Drop the remembered arrangement for the current screens."""
+    fp = fingerprint()
+    plans = read_json(LAYOUTS_PATH, {})
+    if args.name:
+        (plans.get(fp) or {}).pop(args.name, None)
+    else:
+        plans.pop(fp, None)
+    write_json(LAYOUTS_PATH, plans)
+    print(f"forgot layout memory for {fingerprint_label()}")
+    return 0
+
+
+def cmd_clear(args) -> int:
+    save_state(phase="idle", step="", error="", blocked=[])
+    return 0
+
+
+def cmd_retry(args) -> int:
+    name = str(read_state().get("setup") or "").strip()
+    if not name or name.casefold() == EMPTY.casefold():
+        print("there is no saved setup to retry", file=sys.stderr)
+        return 1
+    return cmd_load(argparse.Namespace(name=name, force=args.force))
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="omarchy-tableau", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("status", help="what is loaded right now")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("load", help="close everything, then load a setup")
+    sp.add_argument("name")
+    sp.add_argument("--force", action="store_true", help="close windows that refuse")
+    sp.set_defaults(func=cmd_load)
+
+    sp = sub.add_parser("save", help="save the current desktop as a setup")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_save)
+
+    sp = sub.add_parser("delete", help="delete a saved setup")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_delete)
+
+    sp = sub.add_parser("rename", help="rename a saved setup")
+    sp.add_argument("old"); sp.add_argument("new")
+    sp.set_defaults(func=cmd_rename)
+
+    sp = sub.add_parser("duplicate", help="duplicate a saved setup")
+    sp.add_argument("source"); sp.add_argument("new")
+    sp.set_defaults(func=cmd_duplicate)
+
+    sp = sub.add_parser("init", help="write a starter tableau.toml")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("edit", help="open tableau.toml in your editor")
+    sp.set_defaults(func=cmd_edit)
+
+    sp = sub.add_parser("forget", help="forget the layout memory for these screens")
+    sp.add_argument("name", nargs="?")
+    sp.set_defaults(func=cmd_forget)
+
+    sp = sub.add_parser("clear", help="clear a stuck error/blocked state")
+    sp.set_defaults(func=cmd_clear)
+
+    sp = sub.add_parser("retry", help="retry the last setup load")
+    sp.add_argument("--force", action="store_true", help="also force-close refusing windows")
+    sp.set_defaults(func=cmd_retry)
+
+    args = p.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

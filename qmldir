@@ -1,0 +1,4 @@
+singleton SetupsStore 1.0 SetupsStore.qml
+MenuRow 1.0 MenuRow.qml
+SetupCard 1.0 SetupCard.qml
+LayoutPreview 1.0 LayoutPreview.qml
