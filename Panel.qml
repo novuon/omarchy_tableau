@@ -128,19 +128,8 @@ Panel {
           anchors.centerIn: parent
           color: root.barIconColor
 
-          // A load closes every window on the way, so for most of it the bar
-          // is all there is to look at: the icon becomes a spinner for as
-          // long as it runs. Deliberately no percentage up here -- a number
-          // demands to be read, the spin only says "busy" -- the count lives
-          // in the notification and in the panel.
-          NumberAnimation on rotation {
-            running: SetupsStore.busy
-            from: 0
-            to: 360
-            duration: 1600
-            loops: Animation.Infinite
-          }
-          onRotationChanged: if (!SetupsStore.busy && rotation !== 0) rotation = 0
+          // Keep the layout mark upright. Loading is communicated by the
+          // progress line below and the panel status, not by rotating the mark.
         }
 
         // How far along it is, as a hairline under the glyph.
@@ -251,14 +240,6 @@ Panel {
                 height: width
                 color: SetupsStore.hasProblem ? root.urgent : root.accent
 
-                NumberAnimation on rotation {
-                  running: SetupsStore.busy
-                  from: 0
-                  to: 360
-                  duration: 1600
-                  loops: Animation.Infinite
-                }
-                onRotationChanged: if (!SetupsStore.busy && rotation !== 0) rotation = 0
               }
             }
 
