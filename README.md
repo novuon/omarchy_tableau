@@ -150,6 +150,16 @@ omarchy plugin add https://github.com/novuon/omarchy_tableau.git --enable --yes
 omarchy bar move novuon.tableau --section left
 ```
 
+To remove Tableau safely:
+
+```bash
+omarchy plugin remove novuon.tableau --yes
+```
+
+Removing the plugin does not delete your `~/.config/omarchy/tableau.toml` file
+or saved Tableau state. Reinstalling the plugin can therefore restore your
+previous setup selection without changing your desktop automatically.
+
 For local development:
 
 ```bash
