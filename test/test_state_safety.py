@@ -43,6 +43,12 @@ with tempfile.TemporaryDirectory() as tmp:
 
     state_path = state_home / "omarchy/tableau/state.json"
     state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "setup": "Safe", "phase": "loading", "loader_pid": 999999,
+        "updated": "not-a-timestamp",
+    }))
+    assert cli.read_state()["phase"] == "error"
+
     state_path.write_text("{" + "x" * (cli.MAX_STATE_BYTES + 1) + "}")
     safe = cli.read_state()
     assert safe["setup"] is None
@@ -67,6 +73,12 @@ with tempfile.TemporaryDirectory() as tmp:
     layouts_path = state_path.with_name("layouts.json")
     os.mkfifo(layouts_path)
     assert cli.read_json(layouts_path, {"fallback": True}) == {"fallback": True}
+    layouts_path.unlink()
+    layouts_path.write_text(json.dumps({
+        "screen": {"Broken": {"version": cli.LAYOUT_PLAN_VERSION,
+                                 "workspaces": [{"index": "bad"}]}}
+    }))
+    assert cli.read_layouts() == {}
 
     config_path = config
     config_path.unlink()
@@ -82,5 +94,23 @@ with tempfile.TemporaryDirectory() as tmp:
     cli.cmd_init(type("Args", (), {"force": True})())
     assert config_path.is_file()
     assert "[[setups]]" in config_path.read_text()
+
+    # Invalid numeric configuration is rejected before it can reach timers.
+    config_path.write_text(
+        "[options]\nwindow_wait = inf\n\n[[setups]]\nname = \"Bad\"\n")
+    try:
+        cli.load_config()
+    except cli.ConfigError:
+        pass
+    else:
+        raise AssertionError("non-finite configuration should be rejected")
+
+    # Backup retention is bounded rather than growing on every edit.
+    config_path.write_text("safe")
+    for _ in range(cli.MAX_BACKUPS + 3):
+        cli.write_backup(config_path, "backup")
+    cli.prune_backups(config_path)
+    backups = list(config_path.parent.glob(f".{config_path.name}.bak.*.toml"))
+    assert len(backups) <= cli.MAX_BACKUPS
 
 print("state-safety regression passed")
