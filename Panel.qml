@@ -552,7 +552,13 @@ Panel {
               placeholderText: "Name this setup"
               foreground: root.foreground
               accent: root.accent
-              onAccepted: {
+              // Consume Enter at the text field. If it bubbles to
+              // PanelKeyCatcher after `root.naming` is cleared, the active
+              // setup's cursor is activated too; for Save Current State that
+              // means closing the live desk and loading it again.
+              Keys.onPressed: function(event) {
+                if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return
+                event.accepted = true
                 if (root.namingMode === "rename") SetupsStore.renameSetup(root.namingSource, text)
                 else if (root.namingMode === "duplicate") SetupsStore.duplicateSetup(root.namingSource, text)
                 else SetupsStore.saveCurrent(text)
