@@ -63,4 +63,24 @@ with tempfile.TemporaryDirectory() as tmp:
     assert victim.read_text() == "untouched"
     assert json.loads(state_path.read_text())["setup"] == "Safe"
 
+    # The same protections apply to the layouts and plugin configuration files.
+    layouts_path = state_path.with_name("layouts.json")
+    os.mkfifo(layouts_path)
+    assert cli.read_json(layouts_path, {"fallback": True}) == {"fallback": True}
+
+    config_path = config
+    config_path.unlink()
+    os.mkfifo(config_path)
+    try:
+        cli.load_config()
+    except cli.ConfigError:
+        pass
+    else:
+        raise AssertionError("FIFO configuration should be rejected")
+
+    # Initialization replaces a planted FIFO rather than opening it for writing.
+    cli.cmd_init(type("Args", (), {"force": True})())
+    assert config_path.is_file()
+    assert "[[setups]]" in config_path.read_text()
+
 print("state-safety regression passed")

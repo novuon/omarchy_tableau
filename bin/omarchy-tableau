@@ -49,6 +49,8 @@ LAYOUTS_PATH = STATE_DIR / "layouts.json"
 LOCK_PATH = STATE_DIR / "lock"
 LOG_PATH = STATE_DIR / "load.log"
 MAX_STATE_BYTES = 64 * 1024
+MAX_CONFIG_BYTES = 1024 * 1024
+MAX_LAYOUTS_BYTES = 1024 * 1024
 
 EMPTY = "Empty"  # the built-in do-nothing setup: a bare Omarchy desktop
 
@@ -144,10 +146,34 @@ def fingerprint_label(mons: list[dict] | None = None) -> str:
 # state
 # --------------------------------------------------------------------------
 
-def read_json(path: Path, fallback):
+def read_user_file(path: Path, max_bytes: int) -> str | None:
+    """Read a user-owned regular file without blocking or following links."""
     try:
-        return json.loads(path.read_text())
-    except Exception:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK |
+                     os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_size > max_bytes):
+                return None
+            with os.fdopen(fd, "r") as source:
+                fd = -1
+                return source.read()
+        finally:
+            if fd != -1:
+                os.close(fd)
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def read_json(path: Path, fallback, max_bytes: int = MAX_LAYOUTS_BYTES):
+    text = read_user_file(path, max_bytes)
+    if text is None:
+        return fallback
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, type(fallback)) else fallback
+    except (TypeError, json.JSONDecodeError):
         return fallback
 
 
@@ -157,6 +183,24 @@ def write_json(path: Path, data) -> None:
 
 def write_text_atomic(path: Path, text: str) -> None:
     atomic_write(path, text)
+
+
+def write_backup(path: Path, text: str) -> Path:
+    """Create a private, non-predictable backup beside path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, backup_name = tempfile.mkstemp(
+        prefix=f".{path.name}.bak.", suffix=".toml", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as backup:
+            fd = -1
+            backup.write(text)
+            backup.flush()
+            os.fsync(backup.fileno())
+    finally:
+        if fd != -1:
+            os.close(fd)
+    return Path(backup_name)
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -243,8 +287,17 @@ def save_state(**changes) -> dict:
 
 def log(msg: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a") as f:
-        f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    try:
+        fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                     os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                os.write(fd, f"{time.strftime('%H:%M:%S')} {msg}\n".encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -256,10 +309,13 @@ class ConfigError(Exception):
 
 
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
+    text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
+    if text is None:
+        if CONFIG_PATH.exists():
+            raise ConfigError("configuration file is not a readable user-owned regular file")
         return {"options": {}, "setups": []}
     try:
-        data = tomllib.loads(CONFIG_PATH.read_text())
+        data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(str(e)) from e
     except OSError as e:
@@ -883,7 +939,7 @@ def acquire_lock() -> bool:
             return True
         except FileExistsError:
             try:
-                old = int(LOCK_PATH.read_text().strip())
+                old = int((read_user_file(LOCK_PATH, 32) or "").strip())
                 os.kill(old, 0)
                 return False
             except (OSError, ValueError):
@@ -896,7 +952,7 @@ def acquire_lock() -> bool:
 
 def release_lock() -> None:
     try:
-        if LOCK_PATH.read_text().strip() == str(os.getpid()):
+        if (read_user_file(LOCK_PATH, 32) or "").strip() == str(os.getpid()):
             LOCK_PATH.unlink()
     except OSError:
         pass
@@ -1297,8 +1353,8 @@ def replace_setup_block(text: str, name: str, block: str) -> str:
 
 
 def config_backup_and_write(text: str) -> None:
-    if CONFIG_PATH.exists():
-        CONFIG_PATH.with_name(CONFIG_PATH.name + f".bak.{time.time_ns()}").write_text(text)
+    if read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES) is not None:
+        write_backup(CONFIG_PATH, text)
     write_text_atomic(CONFIG_PATH, text)
 
 
@@ -1322,7 +1378,10 @@ def cmd_delete(args) -> int:
         print(f"config error: {e}", file=sys.stderr); return 1
     if not find_setup(cfg, name):
         print(f"no setup named {name!r}", file=sys.stderr); return 1
-    text = CONFIG_PATH.read_text()
+    text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
+    if text is None:
+        print("configuration file is not a readable user-owned regular file", file=sys.stderr)
+        return 1
     block = setup_block(text, name)
     if block is None:
         print("could not locate setup block", file=sys.stderr); return 1
@@ -1346,7 +1405,9 @@ def cmd_rename(args) -> int:
         print(f"config error: {e}", file=sys.stderr); return 1
     if not find_setup(cfg, old) or find_setup(cfg, new):
         print("source missing or destination already exists", file=sys.stderr); return 1
-    text = CONFIG_PATH.read_text(); block = setup_block(text, old)
+    text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
+    if text is None: return 1
+    block = setup_block(text, old)
     if block is None: return 1
     renamed = re.sub(r'^(\s*name\s*=\s*)(["\']).*?\2',
                      lambda m: m.group(1) + json.dumps(new), block, count=1, flags=re.M)
@@ -1368,7 +1429,9 @@ def cmd_duplicate(args) -> int:
         print(f"config error: {e}", file=sys.stderr); return 1
     if not find_setup(cfg, source) or find_setup(cfg, new):
         print("source missing or destination already exists", file=sys.stderr); return 1
-    text = CONFIG_PATH.read_text(); block = setup_block(text, source)
+    text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
+    if text is None: return 1
+    block = setup_block(text, source)
     if block is None: return 1
     copy = re.sub(r'^(\s*name\s*=\s*)(["\']).*?\2',
                   lambda m: m.group(1) + json.dumps(new), block, count=1, flags=re.M)
@@ -1402,13 +1465,15 @@ def cmd_save(args) -> int:
 
     block = render_setup(name, workspaces, services, icon)
     if CONFIG_PATH.exists():
-        text = CONFIG_PATH.read_text()
+        text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
+        if text is None:
+            print("configuration file is not a readable user-owned regular file", file=sys.stderr)
+            return 1
     else:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         text = STARTER_HEADER
     if CONFIG_PATH.exists():
-        backup = CONFIG_PATH.with_name(CONFIG_PATH.name + f".bak.{time.time_ns()}")
-        backup.write_text(text)
+        write_backup(CONFIG_PATH, text)
     write_text_atomic(CONFIG_PATH, replace_setup_block(text, name, block))
 
     fp = fingerprint()
@@ -1593,7 +1658,7 @@ def cmd_init(args) -> int:
         print(f"{CONFIG_PATH} already exists")
         return 0
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(STARTER_HEADER + STARTER_BODY)
+    write_text_atomic(CONFIG_PATH, STARTER_HEADER + STARTER_BODY)
     print(f"wrote {CONFIG_PATH}")
     return 0
 
