@@ -33,6 +33,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -46,6 +47,7 @@ STATE_PATH = STATE_DIR / "state.json"
 LAYOUTS_PATH = STATE_DIR / "layouts.json"
 LOCK_PATH = STATE_DIR / "lock"
 LOG_PATH = STATE_DIR / "load.log"
+MAX_STATE_BYTES = 64 * 1024
 
 EMPTY = "Empty"  # the built-in do-nothing setup: a bare Omarchy desktop
 
@@ -162,8 +164,27 @@ def write_text_atomic(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
+def read_state_file() -> dict:
+    """Read the small runtime state file without following unsafe inputs."""
+    try:
+        fd = os.open(STATE_PATH, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_size > MAX_STATE_BYTES):
+                return {}
+            with os.fdopen(fd, "r") as state_file:
+                fd = -1
+                return json.load(state_file)
+        finally:
+            if fd != -1:
+                os.close(fd)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def read_state() -> dict:
-    st = read_json(STATE_PATH, {})
+    st = read_state_file()
     if not isinstance(st, dict):
         st = {}
     st.setdefault("setup", None)
@@ -715,6 +736,48 @@ def start_services(specs: list, report) -> list[dict]:
     return started
 
 
+def previous_services(cfg: dict, state: dict) -> list[dict]:
+    """Rebuild teardown records from config, never from state alone.
+
+    State remembers what Tableau started, but it is not an authorization file:
+    another process can replace it between loads. Only service definitions in
+    the selected setup may be carried forward, and persisted PIDs are never
+    accepted for process-group termination.
+    """
+    setup_name = str(state.get("setup") or "").strip()
+    setup = find_setup(cfg, setup_name) if setup_name else None
+    if not setup or not isinstance(state.get("services"), list):
+        return []
+
+    declared = []
+    for raw in setup.get("services") or []:
+        spec = normalize_service(raw)
+        if spec.get("unit"):
+            unit = str(spec["unit"])
+            declared.append(("unit", unit if "." in unit else f"{unit}.service", spec))
+        elif spec.get("run"):
+            declared.append(("run", str(spec["run"]), spec))
+
+    trusted = []
+    for saved in state["services"]:
+        if not isinstance(saved, dict) or saved.get("owned") is not True:
+            continue
+        if saved.get("unit"):
+            value = str(saved["unit"])
+            match = next((item for kind, key, item in declared
+                          if kind == "unit" and key == value), None)
+            if match is not None:
+                trusted.append({"unit": value, "owned": True})
+        elif saved.get("run"):
+            value = str(saved["run"])
+            match = next((item for kind, key, item in declared
+                          if kind == "run" and key == value), None)
+            if match is not None and match.get("stop"):
+                trusted.append({"run": value, "stop": match["stop"],
+                                "dir": match.get("dir", ""), "owned": True})
+    return trusted
+
+
 def stop_services(started: list[dict], report) -> None:
     for spec in reversed(started or []):
         if spec.get("unit") and spec.get("owned") is True:
@@ -730,18 +793,8 @@ def stop_services(started: list[dict], report) -> None:
             subprocess.run(["bash", "-lc", spec["stop"]],
                            cwd=os.path.expanduser(str(spec.get("dir") or "")) or None,
                            capture_output=True)
-        elif spec.get("pid"):
-            report("stopping service")
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(os.getpgid(int(spec["pid"])), sig)
-                except (ProcessLookupError, PermissionError, ValueError):
-                    break
-                time.sleep(0.6)
-                try:
-                    os.kill(int(spec["pid"]), 0)
-                except OSError:
-                    break
+        # Persisted process IDs are deliberately not accepted. A PID can be
+        # reused, and state.json is not a trustworthy ownership boundary.
 
 
 # --------------------------------------------------------------------------
@@ -910,7 +963,7 @@ def cmd_load(args) -> int:
                    replace=True, urgency="normal")
             return 2
 
-        stop_services(prev.get("services") or [], report)
+        stop_services(previous_services(cfg, prev), report)
 
         if setup is None:
             dispatch('hl.dsp.focus({ workspace = "1" })')
