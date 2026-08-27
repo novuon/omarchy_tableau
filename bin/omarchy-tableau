@@ -36,6 +36,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -151,23 +152,44 @@ def read_json(path: Path, fallback):
 
 
 def write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(path)
+    atomic_write(path, json.dumps(data, indent=2))
 
 
 def write_text_atomic(path: Path, text: str) -> None:
+    atomic_write(path, text)
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """Write through a private same-directory file and replace atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as tmp:
+            fd = -1
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if fd != -1:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
 
 
 def read_state_file() -> dict:
     """Read the small runtime state file without following unsafe inputs."""
     try:
-        fd = os.open(STATE_PATH, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(STATE_PATH, os.O_RDONLY | os.O_NONBLOCK |
+                     os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
             info = os.fstat(fd)
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()

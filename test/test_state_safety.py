@@ -48,4 +48,19 @@ with tempfile.TemporaryDirectory() as tmp:
     assert safe["setup"] is None
     assert safe["services"] == []
 
+    # A planted FIFO must be rejected immediately rather than blocking open().
+    state_path.unlink()
+    os.mkfifo(state_path)
+    assert cli.read_state()["setup"] is None
+
+    # A planted predictable .tmp symlink must not receive an atomic write.
+    state_path.unlink()
+    victim = root / "victim"
+    victim.write_text("untouched")
+    predictable_tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+    predictable_tmp.symlink_to(victim)
+    cli.write_json(state_path, {"setup": "Safe"})
+    assert victim.read_text() == "untouched"
+    assert json.loads(state_path.read_text())["setup"] == "Safe"
+
 print("state-safety regression passed")
