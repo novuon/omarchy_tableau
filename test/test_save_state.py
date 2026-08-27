@@ -37,6 +37,8 @@ with tempfile.TemporaryDirectory() as tmp:
         "number": 1,
         "columns": [{"width": 1, "windows": [{"term": "btop"}]}],
     }]
+    cli.close_windows = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("save must never close windows"))
     cli.fingerprint = lambda: "test-screen"
     cli.monitor_of_workspace = lambda number: "test-monitor"
     cli.notify = lambda *args, **kwargs: None
@@ -47,5 +49,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert state["setup"] == "Saved"
     assert state["phase"] == "idle"
     assert 'name = "Saved"' in config.read_text()
+
+    # Chromium exposes its complete command line as one argv[0] in /proc.
+    cli.proc_cmdline = lambda pid: [
+        "/usr/lib/chromium/chromium --ozone-platform=wayland"
+    ]
+    cli.proc_exe = lambda pid: "chromium"
+    spec = cli.window_to_spec({"pid": 123, "class": "chromium"})
+    assert spec["app"] == "/usr/lib/chromium/chromium --ozone-platform=wayland"
 
 print("save-state regression passed")

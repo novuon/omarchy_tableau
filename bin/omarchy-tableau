@@ -1390,6 +1390,16 @@ def window_to_spec(c: dict) -> dict:
     if is_terminal_window(c, argv):
         return terminal_spec(c, argv)
     if argv:
+        # Chromium rewrites its process title so /proc/<pid>/cmdline exposes
+        # the complete command line as argv[0]. Split that representation
+        # back into arguments before shlex.join() serializes it.
+        if len(argv) == 1 and any(ch.isspace() for ch in argv[0]):
+            try:
+                candidate = shlex.split(argv[0])
+            except ValueError:
+                candidate = []
+            if candidate and Path(candidate[0]).name == proc_exe(pid):
+                argv = candidate
         return {"app": shlex.join(argv), "class": c.get("class") or ""}
     return {"app": c.get("class") or "", "class": c.get("class") or ""}
 
