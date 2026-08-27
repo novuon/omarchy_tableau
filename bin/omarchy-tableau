@@ -1866,6 +1866,13 @@ def cmd_clear(args) -> int:
     return 0
 
 
+def cmd_session_reset(args) -> int:
+    """Start a fresh desktop session without deleting saved tableaux."""
+    save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="",
+               blocked=[], services=[], progress={"done": 0, "total": 0})
+    return 0
+
+
 def cmd_retry(args) -> int:
     name = str(read_state().get("setup") or "").strip()
     if not name or name.casefold() == EMPTY.casefold():
@@ -1916,6 +1923,9 @@ def main() -> int:
 
     sp = sub.add_parser("clear", help="clear a stuck error/blocked state")
     sp.set_defaults(func=cmd_clear)
+
+    sp = sub.add_parser("session-reset", help="forget the active tableau for a new desktop session")
+    sp.set_defaults(func=cmd_session_reset)
 
     sp = sub.add_parser("retry", help="retry the last setup load")
     sp.add_argument("--force", action="store_true", help="also force-close refusing windows")
