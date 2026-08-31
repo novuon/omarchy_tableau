@@ -26,6 +26,7 @@ Singleton {
 
   property var setups: []
   property string current: "Empty"
+  property bool currentKnown: false
   property string phase: "idle"
   property string step: ""
   property string error: ""
@@ -39,6 +40,8 @@ Singleton {
   property bool loaded: false
   property bool actionBusy: false
   property string actionLabel: ""
+  property bool restoreLast: false
+  property bool recoveryOffered: false
   property bool recoverable: false
   property string recoverySetup: ""
 
@@ -51,6 +54,8 @@ Singleton {
   }
 
   readonly property bool busy: phase === "loading" || phase === "unloading"
+  readonly property bool restartRecovery:
+    restoreLast && currentKnown && current !== "Empty" && !recoveryOffered
   readonly property bool isBlocked: phase === "blocked"
   readonly property bool hasProblem: isBlocked || error !== "" || configError !== ""
 
@@ -97,6 +102,8 @@ Singleton {
     root.total = payload.progress ? (payload.progress.total || 0) : 0
     root.recoverable = payload.recoverable === true
     root.recoverySetup = payload.recoverySetup || ""
+    root.currentKnown = payload.currentKnown === true
+    root.restoreLast = payload.restoreLast === true
     root.loaded = true
   }
 
@@ -169,6 +176,13 @@ Singleton {
   function clearProblem() { clearProc.running = true }
   function restoreInterrupted() { load(root.recoverySetup, false) }
   function startClean() { sessionResetProc.running = true }
+  function dismissRecovery() { root.recoveryOffered = true }
+  function offerRecovery() { root.recoveryOffered = true }
+  function toggleRestoreLast() {
+    actionProc.command = [root.cli, "set-option", "restore_last", root.restoreLast ? "off" : "on"]
+    root.actionBusy = true
+    actionProc.running = true
+  }
   function retry(force) {
     if (root.actionBusy || root.busy) return
     actionProc.command = [root.cli, "retry"]
@@ -203,6 +217,7 @@ Singleton {
                                               : "Loading " + current + "…"
     if (phase === "error" && error !== "") return "Last load reported a problem"
     if (actionBusy && actionLabel !== "") return actionLabel
+    if (!currentKnown) return "Choose your desktop"
     if (current === "Empty") return "Empty desktop"
     return current
   }
@@ -212,7 +227,9 @@ Singleton {
     if (isBlocked) return blocked.length + " window(s) are still asking about unsaved work"
     if (busy && step !== "") return step
     if (error !== "") return error
-    return screens
+    if (!currentKnown) return "Switch your whole environment in one click"
+    return screens !== "" ? screens + " · switch in one click"
+                            : "Switch your whole environment in one click"
   }
 
   // The one line under a setup's name in the menu: what it starts, in the

@@ -2,20 +2,35 @@
 
 ![Tableau preview](preview.png)
 
-Leave a desktop. Return to it instantly.
+## Leave a desktop. Return to it instantly.
 
-Tableau saves and switches complete Omarchy desktops: workspaces, windows,
-terminals, applications, services, and layouts in one click.
+Tableau turns your whole Omarchy desk into a choice in the bar. Your workspaces,
+windows, terminals, applications, services, and layout come back together — so
+switching from coding to browsing feels like changing rooms, not rebuilding a
+desk.
 
-## Why Tableau?
+### The first minute
 
-- **Work**: return to the same coding desk, terminals, and services.
-- **Browse**: switch to a clean research and file-management environment.
-- **Capture**: save the desktop you already have without writing configuration.
+1. Install Tableau and open it from the bar.
+2. Choose **Work** or **Browse** to try a ready-made desk.
+3. Arrange anything you like, then choose **Capture Current Desktop**.
 
-Install Tableau, open it from the bar, and choose a starter Tableau. On a clean
-install, `Work` and `Browse` are available immediately; no setup command is
-required.
+That is the entire learning curve. Your own tableaus appear beside the starters,
+ready for one-click switching.
+
+## Why people keep it installed
+
+- **Keep context**: return to the same coding desk, terminals, and services.
+- **Change mode**: move to a clean research and file-management environment.
+- **Capture the good state**: save the desktop you already have without writing
+  configuration.
+- **Stay in control**: Tableau asks before recovery and never silently restores
+  a desktop after a restart.
+
+On a clean install, `Work` and `Browse` are available immediately; no setup
+command is required. The cards are previews of the desk each choice builds, and
+the highlighted card always means “currently loaded” — not merely “keyboard
+focus”.
 
 A tableau can open:
 
@@ -42,6 +57,8 @@ Keyboard controls:
 - `r`: refresh
 - `x`: delete the selected tableau
 - Escape: close the menu
+
+Open the centered Tableau switcher at any time with `SUPER + ALT + T`.
 
 ## Configuration
 
@@ -166,10 +183,21 @@ omarchy-tableau clear
 
 ## Install
 
+The fastest path is two commands:
+
 ```bash
 omarchy plugin add https://github.com/novuon/omarchy_tableau.git --enable --yes
 omarchy bar move novuon.tableau --section left
 ```
+
+Then open the Tableau icon in the bar and choose **Work** or **Browse**. Both
+starter tableaus are available immediately on a clean install, so you can try
+the workflow before editing any configuration. When you have a desk worth
+keeping, use **Capture Current Desktop** to save it.
+
+Requirements: Omarchy with the standard `omarchy-shell` and Hyprland helpers.
+Tableau uses the terminal and application launchers already provided by Omarchy;
+there are no extra services or developer tools to install.
 
 To remove Tableau safely:
 

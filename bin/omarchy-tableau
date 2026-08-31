@@ -309,6 +309,7 @@ def read_state() -> dict:
     if not isinstance(st, dict):
         st = {}
     st.setdefault("setup", None)
+    st.setdefault("currentKnown", False)
     st.setdefault("phase", "idle")
     st.setdefault("step", "")
     st.setdefault("error", "")
@@ -489,6 +490,8 @@ def load_config() -> dict:
                 raise ConfigError(f"option `{key}` must be a finite number")
             if not math.isfinite(value) or value <= 0 or value > 3600:
                 raise ConfigError(f"option `{key}` must be between 0 and 3600 seconds")
+    if "restore_last" in data["options"] and not isinstance(data["options"]["restore_last"], bool):
+        raise ConfigError("option `restore_last` must be true or false")
     data["setups"] = setups
     return data
 
@@ -1206,7 +1209,7 @@ def cmd_load(args) -> int:
 
         if setup is None:
             dispatch('hl.dsp.focus({ workspace = "1" })')
-            save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="", recoverable=False, blocked=[], services=[],
+            save_state(setup=EMPTY, currentKnown=True, phase="idle", loader_pid=0, step="", error="", recoverable=False, blocked=[], services=[],
                        fingerprint=fingerprint(), progress={"done": 0, "total": 0})
             notify("Empty desktop", "everything closed", replace=True)
             return 0
@@ -1262,7 +1265,7 @@ def cmd_load(args) -> int:
                 dispatch(f'hl.dsp.focus({{ workspace = "{ws_plan["number"]}" }})')
 
         failed = "; ".join(problems)
-        save_state(phase="idle", loader_pid=0, step="", error=failed, recoverable=False, blocked=[],
+        save_state(currentKnown=True, phase="idle", loader_pid=0, step="", error=failed, recoverable=False, blocked=[],
                    progress={"done": total, "total": total})
         loaded_body = failed or (f"{total} window{'s' if total != 1 else ''} across "
                                  f"{len(plan['workspaces'])} workspace"
@@ -1564,7 +1567,7 @@ def cmd_delete(args) -> int:
     for group in plans.values(): group.pop(name, None)
     write_json(LAYOUTS_PATH, plans)
     if str(read_state().get("setup") or "").casefold() == name.casefold():
-        save_state(setup=EMPTY, phase="idle", error="")
+        save_state(setup=EMPTY, currentKnown=False, phase="idle", error="")
     notify(f"Deleted “{name}”")
     return 0
 
@@ -1658,7 +1661,7 @@ def cmd_save(args) -> int:
                            for i, ws in enumerate(workspaces)],
             "saved": time.time()}
     remember_plan(name, fp, plan)
-    save_state(setup=name, phase="idle", step="", error="")
+    save_state(setup=name, currentKnown=True, phase="idle", step="", error="")
     notify(f"Saved “{name}”", f"{len(workspaces)} workspace(s)")
     print(f"saved {name!r} to {CONFIG_PATH}")
     return 0
@@ -1717,6 +1720,7 @@ def cmd_status(args) -> int:
     st = read_state()
     err = ""
     setups = []
+    restore_last = False
     config_exists = CONFIG_PATH.exists()
     try:
         cfg = load_config()
@@ -1724,6 +1728,7 @@ def cmd_status(args) -> int:
             # Keep the examples discoverable in the menu on first launch,
             # without writing a config until the user chooses one.
             cfg = tomllib.loads(STARTER_HEADER + STARTER_BODY)
+        restore_last = (cfg.get("options") or {}).get("restore_last", False) is True
         for s in cfg["setups"]:
             shape, windows = setup_shape(s)
             setups.append({
@@ -1742,6 +1747,8 @@ def cmd_status(args) -> int:
     payload = {
         "setups": setups,
         "current": st.get("setup") or EMPTY,
+        "currentKnown": st.get("currentKnown", False) is True,
+        "restoreLast": restore_last,
         "phase": st.get("phase", "idle"),
         "step": st.get("step", ""),
         "progress": st.get("progress", {"done": 0, "total": 0}),
@@ -1784,6 +1791,7 @@ STARTER_HEADER = """# Omarchy setups -- one block per project, loaded from the b
 
 [options]
 grace = 8          # seconds a window gets to close politely before we give up
+restore_last = false # offer the last Tableau after a shell restart
 """
 
 
@@ -1850,6 +1858,31 @@ def cmd_init(args) -> int:
     return 0
 
 
+def cmd_set_option(args) -> int:
+    """Update a supported user option while preserving the rest of the file."""
+    if args.option != "restore_last":
+        print(f"unsupported option {args.option!r}", file=sys.stderr)
+        return 1
+    value = args.value.casefold()
+    if value not in ("on", "off", "true", "false"):
+        print("value must be on or off", file=sys.stderr)
+        return 1
+    text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
+    if text is None:
+        print("configuration file is not a readable user-owned regular file", file=sys.stderr)
+        return 1
+    rendered = "true" if value in ("on", "true") else "false"
+    if re.search(r"(?m)^\s*restore_last\s*=", text):
+        updated = re.sub(r"(?m)^(\s*restore_last\s*=\s*).*$", rf"\1{rendered}", text, count=1)
+    elif re.search(r"(?m)^\[options\]\s*$", text):
+        updated = re.sub(r"(?m)^(\[options\]\s*$)", rf"\1\nrestore_last = {rendered}", text, count=1)
+    else:
+        updated = "[options]\nrestore_last = " + rendered + "\n\n" + text
+    config_backup_and_write(updated)
+    print(f"restore_last = {rendered}")
+    return 0
+
+
 def cmd_edit(args) -> int:
     if not CONFIG_PATH.exists():
         cmd_init(argparse.Namespace(force=False))
@@ -1888,7 +1921,7 @@ def cmd_clear(args) -> int:
 
 def cmd_session_reset(args) -> int:
     """Start a fresh desktop session without deleting saved tableaux."""
-    save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="", recoverable=False,
+    save_state(setup=EMPTY, currentKnown=False, phase="idle", loader_pid=0, step="", error="", recoverable=False,
                blocked=[], services=[], progress={"done": 0, "total": 0})
     return 0
 
@@ -1937,6 +1970,11 @@ def main() -> int:
     sp = sub.add_parser("init", help="write a starter tableau.toml")
     sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("set-option", help="update a Tableau option")
+    sp.add_argument("option", choices=["restore_last"])
+    sp.add_argument("value", choices=["on", "off", "true", "false"])
+    sp.set_defaults(func=cmd_set_option)
 
     sp = sub.add_parser("edit", help="open tableau.toml in your editor")
     sp.set_defaults(func=cmd_edit)

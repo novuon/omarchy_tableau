@@ -33,6 +33,7 @@ Panel {
   property int cursorIndex: 0
   property string pendingDelete: ""
   property string recoveryAction: ""
+  property bool settingsExpanded: false
   readonly property int setupRowCount: SetupsStore.setups.length + 3
   readonly property bool selectedStarter:
     cursorIndex > 0 && cursorIndex <= SetupsStore.setups.length
@@ -106,6 +107,16 @@ Panel {
     SetupsStore.refresh()
   }
 
+  Connections {
+    target: SetupsStore
+    function onRestartRecoveryChanged() {
+      if (!root.opened || !SetupsStore.restartRecovery) return
+      root.recoveryAction = "restore"
+      SetupsStore.offerRecovery()
+      recoveryConfirm.opened = true
+    }
+  }
+
   onNamingChanged: {
     if (naming) {
       nameField.text = root.namingMode === "save"
@@ -174,7 +185,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
 
-    readonly property int desiredWidth: Style.space(340)
+    readonly property int desiredWidth: Style.space(420)
     contentWidth: Math.min(desiredWidth,
                            panel.availableCardWidth > 0 ? panel.availableCardWidth : desiredWidth)
     contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, Style.space(560))
@@ -374,7 +385,8 @@ Panel {
 
           MenuRow {
             width: parent.width
-            visible: SetupsStore.recoverable && SetupsStore.recoverySetup !== ""
+            visible: (SetupsStore.recoverable || SetupsStore.restartRecovery)
+                     && SetupsStore.recoverySetup !== ""
             label: "Restore “" + SetupsStore.plain(SetupsStore.recoverySetup) + "”"
             foreground: root.foreground
             accent: root.accent
@@ -384,12 +396,22 @@ Panel {
 
           MenuRow {
             width: parent.width
-            visible: SetupsStore.recoverable
+            visible: SetupsStore.recoverable || SetupsStore.restartRecovery
             label: "Start clean"
             foreground: root.foreground
             accent: root.accent
             fontFamily: root.fontFamily
             onClicked: { root.recoveryAction = "clean"; recoveryConfirm.opened = true }
+          }
+
+          MenuRow {
+            width: parent.width
+            visible: SetupsStore.restartRecovery
+            label: "Not now"
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: SetupsStore.dismissRecovery()
           }
 
           MenuRow {
@@ -412,7 +434,7 @@ Panel {
 
           PanelSectionHeader {
             width: parent.width
-            text: "Tableau"
+            text: "Choose a Tableau"
             foreground: root.foreground
             fontFamily: root.fontFamily
             bottomPadding: Style.space(4)
@@ -426,8 +448,8 @@ Panel {
             glyph: root.iconEmpty
             meta: "closes everything, stops services"
             layout: [{ number: 1, columns: [] }]
-            current: SetupsStore.current === "Empty"
-            hasCursor: root.cursorIndex === 0
+            current: SetupsStore.currentKnown && SetupsStore.current === "Empty"
+            hasCursor: root.cursorIndex === 0 && SetupsStore.currentKnown
             enabledRow: !SetupsStore.busy && !SetupsStore.actionBusy && !SetupsStore.isBlocked
             foreground: root.foreground
             accent: root.accent
@@ -447,7 +469,8 @@ Panel {
               glyph: modelData.icon && modelData.icon !== "" ? modelData.icon : SetupsStore.iconSetups
               meta: SetupsStore.metaFor(modelData)
               layout: modelData.layout || []
-              current: SetupsStore.current === modelData.name
+              featured: modelData.starter === true
+              current: SetupsStore.currentKnown && SetupsStore.current === modelData.name
               hasCursor: root.cursorIndex === index + 1
               enabledRow: !SetupsStore.busy && !SetupsStore.actionBusy && !SetupsStore.isBlocked
               foreground: root.foreground
@@ -483,7 +506,7 @@ Panel {
             spacing: Style.space(8)
             topPadding: visible ? Style.space(6) : 0
 
-            Button {
+            FitButton {
               width: (parent.width - Style.space(16)) / 3
               text: "Rename"
               bordered: true
@@ -494,7 +517,7 @@ Panel {
               fontFamily: root.fontFamily
               onClicked: root.beginNaming("rename")
             }
-            Button {
+            FitButton {
               width: (parent.width - Style.space(16)) / 3
               text: "Duplicate"
               bordered: true
@@ -505,7 +528,7 @@ Panel {
               fontFamily: root.fontFamily
               onClicked: root.beginNaming("duplicate")
             }
-            Button {
+            FitButton {
               width: (parent.width - Style.space(16)) / 3
               text: "Delete"
               bordered: true
@@ -533,9 +556,10 @@ Panel {
 
             readonly property real saveWidth: Math.round((width - Style.space(8)) * 0.62)
 
-            Button {
+            FitButton {
               width: actions.saveWidth
-              text: "Capture Current Desktop"
+              text: "Capture Desktop"
+              tooltipText: "Capture Current Desktop"
               iconText: root.iconSave
               bordered: true
               leftAlign: true
@@ -546,7 +570,7 @@ Panel {
               onClicked: { root.namingMode = "capture"; root.namingSource = ""; root.naming = true }
             }
 
-            Button {
+            FitButton {
               width: actions.width - Style.space(8) - actions.saveWidth
               text: SetupsStore.configExists ? "Edit" : "Create"
               iconText: SetupsStore.configExists ? root.iconEdit : root.iconCreate
@@ -602,6 +626,32 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
+          }
+
+          Item { width: 1; height: Style.space(8) }
+
+          MenuRow {
+            width: parent.width
+            label: "Settings"
+            detail: root.settingsExpanded ? "−" : "+"
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: root.settingsExpanded = !root.settingsExpanded
+          }
+
+          Toggle {
+            width: parent.width
+            visible: root.settingsExpanded
+            label: "Restore last Tableau after restart"
+            description: "Ask before rebuilding your last known Tableau when the shell starts."
+            checked: SetupsStore.restoreLast
+            enabled: SetupsStore.configExists && SetupsStore.configError === ""
+                     && !SetupsStore.busy && !SetupsStore.actionBusy
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: SetupsStore.toggleRestoreLast()
           }
         }
       }

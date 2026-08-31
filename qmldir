@@ -1,4 +1,5 @@
 singleton SetupsStore 1.0 SetupsStore.qml
+FitButton 1.0 FitButton.qml
 MenuRow 1.0 MenuRow.qml
 SetupCard 1.0 SetupCard.qml
 LayoutPreview 1.0 LayoutPreview.qml

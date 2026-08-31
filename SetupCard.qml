@@ -18,6 +18,7 @@ Item {
   property var layout: []
   property bool current: false
   property bool hasCursor: false
+  property bool featured: false
   property bool enabledRow: true
   property color foreground: Color.foreground
   property color accent: Color.accent
@@ -111,15 +112,43 @@ Item {
     anchors.verticalCenter: parent.verticalCenter
     spacing: Style.space(1)
 
-    Text {
+    Row {
       width: parent.width
-      text: root.label
-      textFormat: Text.PlainText
-      elide: Text.ElideRight
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
-      font.bold: root.current
+      spacing: Style.space(5)
+
+      Text {
+        width: Math.max(0, parent.width - (root.featured ? badge.width + parent.spacing : 0))
+        text: root.label
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: root.current
+      }
+
+      Rectangle {
+        id: badge
+        visible: root.featured
+        width: visible ? badgeText.implicitWidth + Style.space(8) : 0
+        height: Style.space(14)
+        radius: height / 2
+        color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)
+        border.width: 1
+        border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.38)
+
+        Text {
+          id: badgeText
+          anchors.centerIn: parent
+          text: "START HERE"
+          textFormat: Text.PlainText
+          color: root.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          font.letterSpacing: 0.7
+        }
+      }
     }
 
     Text {
