@@ -1140,6 +1140,16 @@ def cmd_load(args) -> int:
     started_services: list[dict] = []
     try:
         cfg = load_config()
+        # A fresh install exposes the bundled examples in the menu before a
+        # config exists. Materialize that starter file only when one of those
+        # examples is actually selected; an existing config is never
+        # replaced or augmented implicitly.
+        if not CONFIG_PATH.exists() and name.lower() != EMPTY.lower():
+            starter = tomllib.loads(STARTER_HEADER + STARTER_BODY)
+            starter_setup = find_setup(starter, name)
+            if starter_setup is not None:
+                cmd_init(argparse.Namespace(force=False))
+                cfg = load_config()
     except ConfigError as e:
         save_state(phase="error", error=f"tableau.toml: {e}", step="")
         print(f"config error: {e}", file=sys.stderr)
@@ -1705,13 +1715,19 @@ def cmd_status(args) -> int:
     st = read_state()
     err = ""
     setups = []
+    config_exists = CONFIG_PATH.exists()
     try:
         cfg = load_config()
+        if not config_exists:
+            # Keep the examples discoverable in the menu on first launch,
+            # without writing a config until the user chooses one.
+            cfg = tomllib.loads(STARTER_HEADER + STARTER_BODY)
         for s in cfg["setups"]:
             shape, windows = setup_shape(s)
             setups.append({
                 "name": s["name"],
                 "icon": s.get("icon", ""),
+                "starter": not config_exists,
                 "workspaces": len(s.get("workspaces") or []),
                 "services": len(s.get("services") or []),
                 "windows": windows,
@@ -1731,7 +1747,7 @@ def cmd_status(args) -> int:
         "blocked": st.get("blocked", []),
         "configError": err,
         "configPath": str(CONFIG_PATH),
-        "configExists": CONFIG_PATH.exists(),
+        "configExists": config_exists,
         "screens": fingerprint_label(mons),
         "fingerprint": fingerprint(mons),
         "known": bool(remembered_plan(st.get("setup") or "", fingerprint(mons))),

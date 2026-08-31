@@ -33,6 +33,9 @@ Panel {
   property int cursorIndex: 0
   property string pendingDelete: ""
   readonly property int setupRowCount: SetupsStore.setups.length + 3
+  readonly property bool selectedStarter:
+    cursorIndex > 0 && cursorIndex <= SetupsStore.setups.length
+    && SetupsStore.setups[cursorIndex - 1].starter === true
 
   function moveCursor(dy) {
     cursorIndex = Math.max(0, Math.min(root.setupRowCount - 1, cursorIndex + dy))
@@ -51,7 +54,7 @@ Panel {
 
   function deleteCursor() {
     var i = root.cursorIndex - 1
-    if (i >= 0 && i < SetupsStore.setups.length) {
+    if (i >= 0 && i < SetupsStore.setups.length && !root.selectedStarter) {
       root.pendingDelete = SetupsStore.setups[i].name
       deleteConfirm.opened = true
     }
@@ -59,7 +62,7 @@ Panel {
 
   function beginNaming(mode) {
     var i = root.cursorIndex - 1
-    if (i < 0 || i >= SetupsStore.setups.length) return
+    if (i < 0 || i >= SetupsStore.setups.length || root.selectedStarter) return
     root.namingMode = mode
     root.namingSource = SetupsStore.setups[i].name
     root.naming = true
@@ -455,6 +458,7 @@ Panel {
           Row {
             width: parent.width
             visible: root.cursorIndex > 0 && root.cursorIndex <= SetupsStore.setups.length
+                     && !root.selectedStarter
             spacing: Style.space(8)
             topPadding: visible ? Style.space(6) : 0
 
