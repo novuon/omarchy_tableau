@@ -10,6 +10,7 @@ python3 -m py_compile bin/omarchy-tableau
 rm -rf bin/__pycache__
 python3 test/test_save_state.py
 python3 test/test_state_safety.py
+python3 test/test_first_run.py
 
 # The generated starter config must remain usable on a fresh Omarchy install.
 # Keep this guard close to the source template so optional developer tools do

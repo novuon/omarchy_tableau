@@ -1,6 +1,21 @@
 # Tableau
 
-Tableau saves complete Omarchy desktops.
+![Tableau preview](preview.png)
+
+Leave a desktop. Return to it instantly.
+
+Tableau saves and switches complete Omarchy desktops: workspaces, windows,
+terminals, applications, services, and layouts in one click.
+
+## Why Tableau?
+
+- **Work**: return to the same coding desk, terminals, and services.
+- **Browse**: switch to a clean research and file-management environment.
+- **Capture**: save the desktop you already have without writing configuration.
+
+Install Tableau, open it from the bar, and choose a starter Tableau. On a clean
+install, `Work` and `Browse` are available immediately; no setup command is
+required.
 
 A tableau can open:
 
@@ -9,14 +24,14 @@ A tableau can open:
 - applications
 - background services
 
-Choose a tableau from the bar. Tableau closes the current desktop, then opens
-the new one. Nothing starts at login.
+Choose a Tableau from the bar. Tableau closes the current desktop, then opens
+the new one. Nothing starts automatically at login.
 
 ## The bar menu
 
 - **Empty desktop** closes all windows and stops services started by Tableau.
 - **Saved tableaus** load a desktop layout.
-- **Save current state** saves the windows that are open now.
+- **Capture Current Desktop** saves the windows that are open now.
 - **Rename**, **Duplicate**, and **Delete** manage saved tableaus.
 - **Edit** opens the configuration file.
 
@@ -128,11 +143,17 @@ omarchy-tableau forget
 Tableau opens windows one at a time. A missing application is reported in the
 menu. If a window refuses to close, Tableau pauses and asks what to do.
 
+If a load is interrupted by a crash or shell restart, Tableau marks it as
+recoverable and offers **Restore** and **Start clean** in the menu. It never
+silently replaces the current desktop.
+
 ## CLI
 
 ```bash
 omarchy-tableau status [--json]
 omarchy-tableau load Work [--force]
+omarchy-tableau capture "New tableau"
+# `save` remains available as a compatibility alias.
 omarchy-tableau save "New tableau"
 omarchy-tableau rename "New tableau" "Renamed tableau"
 omarchy-tableau duplicate Work "Work copy"

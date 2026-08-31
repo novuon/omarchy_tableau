@@ -316,6 +316,7 @@ def read_state() -> dict:
     st.setdefault("services", [])
     st.setdefault("progress", {"done": 0, "total": 0})
     st.setdefault("loader_pid", 0)
+    st.setdefault("recoverable", False)
     phase = st.get("phase", "idle")
     try:
         pid = int(st.get("loader_pid") or 0)
@@ -331,7 +332,8 @@ def read_state() -> dict:
                 updated = 0
             if time.time() - updated > 3:
                 st.update(phase="error", loader_pid=0,
-                          error="The previous setup load stopped unexpectedly")
+                          error="The previous setup load stopped unexpectedly",
+                          recoverable=True)
                 write_json(STATE_PATH, st)
     return st
 
@@ -1184,7 +1186,7 @@ def cmd_load(args) -> int:
     try:
         notify(head, "closing the current desk", sticky=True)
         # --- tear the old desk down -----------------------------------------
-        save_state(phase="unloading", loader_pid=os.getpid(), step="saving and closing", error="", blocked=[],
+        save_state(phase="unloading", loader_pid=os.getpid(), step="saving and closing", error="", recoverable=False, blocked=[],
                    progress={"done": 0, "total": 0})
         # Windows first, services second. A switch that stalls on an unsaved
         # document should leave the desk exactly as it was -- including the
@@ -1204,7 +1206,7 @@ def cmd_load(args) -> int:
 
         if setup is None:
             dispatch('hl.dsp.focus({ workspace = "1" })')
-            save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="", blocked=[], services=[],
+            save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="", recoverable=False, blocked=[], services=[],
                        fingerprint=fingerprint(), progress={"done": 0, "total": 0})
             notify("Empty desktop", "everything closed", replace=True)
             return 0
@@ -1218,7 +1220,7 @@ def cmd_load(args) -> int:
         workspaces = setup.get("workspaces") or []
         total = sum(len(c.get("windows") or []) for ws in workspaces for c in (ws.get("columns") or []))
         save_state(phase="loading", setup=setup["name"], fingerprint=fp,
-                   progress={"done": 0, "total": total}, error="", blocked=[])
+                   progress={"done": 0, "total": total}, error="", recoverable=False, blocked=[])
 
         services = start_services(setup.get("services") or [], report)
         started_services = services
@@ -1260,7 +1262,7 @@ def cmd_load(args) -> int:
                 dispatch(f'hl.dsp.focus({{ workspace = "{ws_plan["number"]}" }})')
 
         failed = "; ".join(problems)
-        save_state(phase="idle", loader_pid=0, step="", error=failed, blocked=[],
+        save_state(phase="idle", loader_pid=0, step="", error=failed, recoverable=False, blocked=[],
                    progress={"done": total, "total": total})
         loaded_body = failed or (f"{total} window{'s' if total != 1 else ''} across "
                                  f"{len(plan['workspaces'])} workspace"
@@ -1271,7 +1273,7 @@ def cmd_load(args) -> int:
     except Exception as e:  # never leave the panel stuck on "loading"
         log(f"FATAL {e!r}")
         stop_services(started_services, report)
-        save_state(phase="error", loader_pid=0, step="", error=str(e))
+        save_state(phase="error", loader_pid=0, step="", error=str(e), recoverable=False)
         notify("Setup switch failed", str(e), replace=True, urgency="critical")
         return 1
     finally:
@@ -1744,6 +1746,8 @@ def cmd_status(args) -> int:
         "step": st.get("step", ""),
         "progress": st.get("progress", {"done": 0, "total": 0}),
         "error": st.get("error", ""),
+        "recoverable": st.get("recoverable", False) is True,
+        "recoverySetup": st.get("setup") or "",
         "blocked": st.get("blocked", []),
         "configError": err,
         "configPath": str(CONFIG_PATH),
@@ -1878,13 +1882,13 @@ def cmd_forget(args) -> int:
 
 
 def cmd_clear(args) -> int:
-    save_state(phase="idle", step="", error="", blocked=[])
+    save_state(phase="idle", step="", error="", recoverable=False, blocked=[])
     return 0
 
 
 def cmd_session_reset(args) -> int:
     """Start a fresh desktop session without deleting saved tableaux."""
-    save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="",
+    save_state(setup=EMPTY, phase="idle", loader_pid=0, step="", error="", recoverable=False,
                blocked=[], services=[], progress={"done": 0, "total": 0})
     return 0
 
@@ -1911,6 +1915,10 @@ def main() -> int:
     sp.set_defaults(func=cmd_load)
 
     sp = sub.add_parser("save", help="save the current desktop as a setup")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_save)
+
+    sp = sub.add_parser("capture", help="capture the current desktop as a setup")
     sp.add_argument("name")
     sp.set_defaults(func=cmd_save)
 

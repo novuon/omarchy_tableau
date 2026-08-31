@@ -32,6 +32,7 @@ Panel {
   property string namingSource: ""
   property int cursorIndex: 0
   property string pendingDelete: ""
+  property string recoveryAction: ""
   readonly property int setupRowCount: SetupsStore.setups.length + 3
   readonly property bool selectedStarter:
     cursorIndex > 0 && cursorIndex <= SetupsStore.setups.length
@@ -373,6 +374,26 @@ Panel {
 
           MenuRow {
             width: parent.width
+            visible: SetupsStore.recoverable && SetupsStore.recoverySetup !== ""
+            label: "Restore “" + SetupsStore.plain(SetupsStore.recoverySetup) + "”"
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: { root.recoveryAction = "restore"; recoveryConfirm.opened = true }
+          }
+
+          MenuRow {
+            width: parent.width
+            visible: SetupsStore.recoverable
+            label: "Start clean"
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: { root.recoveryAction = "clean"; recoveryConfirm.opened = true }
+          }
+
+          MenuRow {
+            width: parent.width
             visible: SetupsStore.isBlocked
             label: "Dismiss"
             foreground: root.foreground
@@ -514,7 +535,7 @@ Panel {
 
             Button {
               width: actions.saveWidth
-              text: "Save Current State"
+              text: "Capture Current Desktop"
               iconText: root.iconSave
               bordered: true
               leftAlign: true
@@ -522,7 +543,7 @@ Panel {
               foreground: root.foreground
               accent: root.accent
               fontFamily: root.fontFamily
-              onClicked: { root.namingMode = "save"; root.namingSource = ""; root.naming = true }
+              onClicked: { root.namingMode = "capture"; root.namingSource = ""; root.naming = true }
             }
 
             Button {
@@ -574,7 +595,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "Saves the windows open right now, in the columns they are in."
+              text: "Captures the desktop exactly as it is, including its workspaces and windows."
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
               color: root.dimmer
@@ -584,6 +605,25 @@ Panel {
           }
         }
       }
+    }
+
+    ConfirmDialog {
+      id: recoveryConfirm
+      anchors.fill: parent
+      z: 9
+      message: root.recoveryAction === "restore"
+               ? "Restore the interrupted “" + SetupsStore.plain(SetupsStore.recoverySetup) + "” Tableau?"
+               : "Start with a clean desktop? The interrupted load will be dismissed."
+      confirmText: root.recoveryAction === "restore" ? "Restore" : "Start clean"
+      cancelText: "Cancel"
+      fontFamily: root.fontFamily
+      onConfirmed: {
+        if (root.recoveryAction === "restore") SetupsStore.restoreInterrupted()
+        else SetupsStore.startClean()
+        root.recoveryAction = ""
+        recoveryConfirm.opened = false
+      }
+      onCanceled: { root.recoveryAction = ""; recoveryConfirm.opened = false }
     }
 
     ConfirmDialog {

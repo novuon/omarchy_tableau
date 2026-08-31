@@ -38,6 +38,9 @@ Singleton {
   property int total: 0
   property bool loaded: false
   property bool actionBusy: false
+  property string actionLabel: ""
+  property bool recoverable: false
+  property string recoverySetup: ""
 
   function cursorIndexForCurrent() {
     if (root.current === "Empty") return 0
@@ -92,6 +95,8 @@ Singleton {
     root.known = payload.known === true
     root.done = payload.progress ? (payload.progress.done || 0) : 0
     root.total = payload.progress ? (payload.progress.total || 0) : 0
+    root.recoverable = payload.recoverable === true
+    root.recoverySetup = payload.recoverySetup || ""
     root.loaded = true
   }
 
@@ -127,7 +132,8 @@ Singleton {
     // Empty while the save process is still finishing.
     root.current = savedName
     root.error = ""
-    saveProc.command = [root.cli, "save", savedName]
+    root.actionLabel = "Capturing current desktop"
+    saveProc.command = [root.cli, "capture", savedName]
     root.actionBusy = true
     saveProc.running = true
   }
@@ -138,6 +144,7 @@ Singleton {
     stdout: StdioCollector { onStreamFinished: root.refresh() }
     onExited: function(code) {
       root.actionBusy = false
+      root.actionLabel = ""
       if (code !== 0 && root.error === "") root.error = "Could not save the current desktop"
       root.refresh()
     }
@@ -160,6 +167,8 @@ Singleton {
   function edit() { Quickshell.execDetached([root.cli, "edit"]) }
   function createConfig() { Quickshell.execDetached([root.cli, "init"]) ; Qt.callLater(root.refresh) }
   function clearProblem() { clearProc.running = true }
+  function restoreInterrupted() { load(root.recoverySetup, false) }
+  function startClean() { sessionResetProc.running = true }
   function retry(force) {
     if (root.actionBusy || root.busy) return
     actionProc.command = [root.cli, "retry"]
@@ -171,6 +180,12 @@ Singleton {
   Process {
     id: clearProc
     command: [root.cli, "clear"]
+    onExited: root.refresh()
+  }
+
+  Process {
+    id: sessionResetProc
+    command: [root.cli, "session-reset"]
     onExited: root.refresh()
   }
 
@@ -187,6 +202,7 @@ Singleton {
     if (phase === "loading") return total > 0 ? "Loading " + current + " — " + done + "/" + total
                                               : "Loading " + current + "…"
     if (phase === "error" && error !== "") return "Last load reported a problem"
+    if (actionBusy && actionLabel !== "") return actionLabel
     if (current === "Empty") return "Empty desktop"
     return current
   }
