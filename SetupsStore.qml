@@ -149,7 +149,7 @@ Singleton {
     id: saveProc
     stderr: StdioCollector { onStreamFinished: if (text !== "") root.error = String(text).trim() }
     stdout: StdioCollector { onStreamFinished: root.refresh() }
-    onExited: function(code) {
+    onExited: function(code, exitStatus) {
       root.actionBusy = false
       root.actionLabel = ""
       if (code !== 0 && root.error === "") root.error = "Could not save the current desktop"
@@ -160,7 +160,7 @@ Singleton {
   Process {
     id: actionProc
     stderr: StdioCollector { onStreamFinished: if (text !== "") root.error = String(text).trim() }
-    onExited: function(code) {
+    onExited: function(code, exitStatus) {
       root.actionBusy = false
       if (code !== 0 && root.error === "") root.error = "Tableau action failed"
       root.refresh()
@@ -194,13 +194,13 @@ Singleton {
   Process {
     id: clearProc
     command: [root.cli, "clear"]
-    onExited: root.refresh()
+    onExited: function(code, exitStatus) { root.refresh() }
   }
 
   Process {
     id: sessionResetProc
     command: [root.cli, "session-reset"]
-    onExited: root.refresh()
+    onExited: function(code, exitStatus) { root.refresh() }
   }
 
   // --- derived text ---------------------------------------------------

@@ -26,7 +26,15 @@ if [[ -z "$qmllint_bin" && -x /usr/lib/qt6/bin/qmllint ]]; then
 fi
 
 if [[ -n "$qmllint_bin" ]]; then
-  "$qmllint_bin" -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" \
+  # Import the exact Omarchy qmldir files. Quickshell's runtime-provided
+  # singleton/component types still cannot be described completely to
+  # standalone qmllint, so keep those diagnostics informational while making
+  # syntax, import, and other real warnings fail validation.
+  "$qmllint_bin" -W 0 \
+    -i "${OMARCHY_PATH:-/usr/share/omarchy}/shell/Commons/qmldir" \
+    -i "${OMARCHY_PATH:-/usr/share/omarchy}/shell/Ui/qmldir" \
+    --unqualified info --missing-property info --signal-handler-parameters info \
+    --unresolved-type info \
     LayoutPreview.qml MenuRow.qml Panel.qml SetupCard.qml SetupsStore.qml
 else
   echo "qmllint not found; skipping QML lint" >&2
@@ -34,7 +42,7 @@ fi
 
 # Saving must persist the new setup as the active selection, and the QML store
 # must not let a stale Empty poll overwrite that selection while saving.
-rg -q 'save_state\(setup=name, phase="idle"' bin/omarchy-tableau
+rg -q 'save_state\(setup=name, currentKnown=True, phase="idle"' bin/omarchy-tableau
 rg -q 'root\.actionBusy && reportedCurrent === "Empty"' SetupsStore.qml
 
 echo "Tableau validation passed"

@@ -34,6 +34,7 @@ import os
 import re
 import shlex
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -54,6 +55,19 @@ MAX_CONFIG_BYTES = 1024 * 1024
 MAX_LAYOUTS_BYTES = 1024 * 1024
 MAX_BACKUPS = 5
 COMMAND_TIMEOUT = 30
+MAX_NAME_CHARS = 80
+MAX_COMMAND_CHARS = 4096
+MAX_PATH_CHARS = 4096
+MAX_MONITOR_CHARS = 128
+MAX_SETUPS = 64
+MAX_WORKSPACES = 100
+MAX_COLUMNS = 16
+MAX_WINDOWS = 64
+MAX_SERVICES = 64
+MAX_TOTAL_WINDOWS = 256
+MAX_LOG_BYTES = 256 * 1024
+MAX_LOG_LINE = 512
+WINDOW_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]+$")
 
 EMPTY = "Empty"  # the built-in do-nothing setup: a bare Omarchy desktop
 
@@ -244,14 +258,19 @@ def write_backup(path: Path, text: str) -> Path:
 def prune_backups(path: Path) -> None:
     """Keep a small bounded set of Tableau's own configuration backups."""
     prefix = f".{path.name}.bak."
-    candidates = sorted(
-        (p for p in path.parent.iterdir()
-         if p.name.startswith(prefix) and p.name.endswith(".toml")
-         and not p.is_dir()),
-        key=lambda p: p.stat().st_mtime_ns if p.exists() else 0,
-        reverse=True,
-    )
-    for backup in candidates[MAX_BACKUPS:]:
+    candidates = []
+    for candidate in path.parent.iterdir():
+        if (not candidate.name.startswith(prefix)
+                or not candidate.name.endswith(".toml")):
+            continue
+        try:
+            info = candidate.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+            candidates.append((candidate, info.st_mtime_ns))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    for backup, _ in candidates[MAX_BACKUPS:]:
         try:
             backup.unlink()
         except FileNotFoundError:
@@ -349,12 +368,16 @@ def save_state(**changes) -> dict:
 
 def log(msg: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # Logs are diagnostics, not a transcript of user commands. Keep them
+    # bounded and strip control characters so config text cannot forge lines.
+    msg = re.sub(r"[\x00-\x1f\x7f]", " ", str(msg))[:MAX_LOG_LINE]
     try:
         fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND |
                      os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         try:
             info = os.fstat(fd)
-            if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+            if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                    and info.st_size < MAX_LOG_BYTES):
                 os.write(fd, f"{time.strftime('%H:%M:%S')} {msg}\n".encode())
         finally:
             os.close(fd)
@@ -368,6 +391,36 @@ def log(msg: str) -> None:
 
 class ConfigError(Exception):
     pass
+
+
+def bounded_string(value, label: str, limit: int, *, allow_empty: bool = True) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} must be a string")
+    if not allow_empty and not value.strip():
+        raise ConfigError(f"{label} must not be empty")
+    if len(value) > limit:
+        raise ConfigError(f"{label} is too long")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ConfigError(f"{label} contains control characters")
+    return value
+
+
+def parse_command(value: str, label: str, *, allow_empty: bool = False) -> list[str]:
+    bounded_string(value, label, MAX_COMMAND_CHARS, allow_empty=allow_empty)
+    if not value.strip():
+        return []
+    try:
+        argv = shlex.split(value)
+    except ValueError as e:
+        raise ConfigError(f"{label} has invalid quoting") from e
+    if not argv:
+        raise ConfigError(f"{label} must not be empty")
+    return argv
+
+
+def safe_window_address(value) -> str | None:
+    address = str(value or "")
+    return address if WINDOW_ADDRESS_RE.fullmatch(address) else None
 
 
 def load_config() -> dict:
@@ -386,9 +439,15 @@ def load_config() -> dict:
     setups = data.get("setups") or []
     if not isinstance(setups, list):
         raise ConfigError("`setups` must be a list of [[setups]] blocks")
+    if len(setups) > MAX_SETUPS:
+        raise ConfigError(f"too many setups (maximum {MAX_SETUPS})")
+    total_windows = 0
     for i, s in enumerate(setups):
         if not isinstance(s, dict) or not s.get("name"):
             raise ConfigError(f"setup #{i + 1} has no name")
+        bounded_string(s["name"], f"setup #{i + 1} name", MAX_NAME_CHARS, allow_empty=False)
+        if "icon" in s:
+            bounded_string(s["icon"], f"{s['name']}: icon", 32)
         names = [str(item.get("name", "")).strip().casefold() for item in setups
                  if isinstance(item, dict)]
         if len(names) != len(set(names)):
@@ -396,6 +455,8 @@ def load_config() -> dict:
         workspaces = s.get("workspaces") or []
         if not isinstance(workspaces, list):
             raise ConfigError(f"{s['name']}: workspaces must be a list")
+        if len(workspaces) > MAX_WORKSPACES:
+            raise ConfigError(f"{s['name']}: too many workspaces")
         numbers = []
         for w in workspaces:
             if not isinstance(w, dict):
@@ -414,12 +475,18 @@ def load_config() -> dict:
             columns = w.get("columns") or []
             if not isinstance(columns, list):
                 raise ConfigError(f"{s['name']}: columns must be a list")
+            if len(columns) > MAX_COLUMNS:
+                raise ConfigError(f"{s['name']}: too many columns")
+            if "monitor" in w:
+                bounded_string(w["monitor"], f"{s['name']}: monitor", MAX_MONITOR_CHARS)
             for c in columns:
                 if not isinstance(c, dict):
                     raise ConfigError(f"{s['name']}: every column must be a table")
                 windows = c.get("windows") or []
                 if not isinstance(windows, list):
                     raise ConfigError(f"{s['name']}: windows must be a list")
+                if len(windows) > MAX_WINDOWS:
+                    raise ConfigError(f"{s['name']}: too many windows in a column")
                 for win in windows:
                     if not isinstance(win, dict):
                         raise ConfigError(f"{s['name']}: every window must be a table")
@@ -429,9 +496,18 @@ def load_config() -> dict:
                         raise ConfigError(f"{s['name']}: window `term` must be a string")
                     if "app" in win and not isinstance(win["app"], str):
                         raise ConfigError(f"{s['name']}: window `app` must be a string")
+                    if "term" in win:
+                        parse_command(win["term"], f"{s['name']}: window term", allow_empty=True)
+                    if "app" in win:
+                        parse_command(win["app"], f"{s['name']}: window app")
                     for key in ("dir", "class"):
                         if key in win and not isinstance(win[key], str):
                             raise ConfigError(f"{s['name']}: window `{key}` must be a string")
+                    if "dir" in win:
+                        bounded_string(win["dir"], f"{s['name']}: window dir", MAX_PATH_CHARS)
+                    if "class" in win:
+                        bounded_string(win["class"], f"{s['name']}: window class", MAX_NAME_CHARS)
+                    total_windows += 1
                     if "wait" in win:
                         try:
                             wait = float(win["wait"])
@@ -451,6 +527,8 @@ def load_config() -> dict:
         services = s.get("services") or []
         if not isinstance(services, list):
             raise ConfigError(f"{s['name']}: services must be a list")
+        if len(services) > MAX_SERVICES:
+            raise ConfigError(f"{s['name']}: too many services")
         for service in services:
             if not isinstance(service, (str, dict)):
                 raise ConfigError(f"{s['name']}: every service must be a string or table")
@@ -458,12 +536,19 @@ def load_config() -> dict:
                 for key in ("unit", "run", "stop", "dir"):
                     if key in service and not isinstance(service[key], str):
                         raise ConfigError(f"{s['name']}: service `{key}` must be a string")
+                for key in ("run", "stop"):
+                    if key in service and (key == "run" or service[key].strip()):
+                        parse_command(service[key], f"{s['name']}: service {key}")
+                if "dir" in service:
+                    bounded_string(service["dir"], f"{s['name']}: service dir", MAX_PATH_CHARS)
                 if service.get("unit") and not re.fullmatch(
                         r"[\w@.\\-]+(?:\.(service|socket|target|timer|scope|path))?",
                         service["unit"]):
                     raise ConfigError(f"{s['name']}: service unit name is invalid")
                 if not service.get("unit") and not service.get("run"):
                     raise ConfigError(f"{s['name']}: service needs `unit` or `run`")
+        if total_windows > MAX_TOTAL_WINDOWS:
+            raise ConfigError(f"{s['name']}: too many windows in total")
         if "focus" in s:
             try:
                 focus = int(s["focus"])
@@ -590,11 +675,7 @@ def fold_columns(columns: list[dict], keep: int) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def has(cmd: str) -> bool:
-    try:
-        return subprocess.run(["sh", "-c", f"command -v {shlex.quote(cmd)}"],
-                              capture_output=True, timeout=5).returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
+    return shutil.which(cmd) is not None
 
 
 def launch_prefix() -> list[str]:
@@ -608,7 +689,10 @@ def app_id_for(cmd: str) -> str:
     """The app-id a terminal running `cmd` gets, when the setup names none."""
     if not cmd:
         return APP_ID_PREFIX + "terminal"
-    leaf = Path(shlex.split(cmd)[0]).name
+    try:
+        leaf = Path(shlex.split(cmd)[0]).name
+    except ValueError:
+        leaf = "terminal"
     return APP_ID_PREFIX + (re.sub(r"[^A-Za-z0-9_-]", "-", leaf) or "terminal")
 
 
@@ -624,11 +708,11 @@ def spawn_window(win: dict) -> None:
         if workdir:
             argv.append(f"--dir={workdir}")
         if cmd:
-            argv += ["-e", *shlex.split(cmd)]
+            argv += ["-e", *parse_command(cmd, "window term")]
     else:
-        argv = [*launch_prefix(), *shlex.split(str(win["app"]))]
+        argv = [*launch_prefix(), *parse_command(str(win["app"]), "window app")]
 
-    log(f"spawn: {' '.join(argv)}")
+    log(f"spawn: {Path(argv[-1]).name if argv else 'window'}")
     subprocess.Popen(argv, cwd=workdir, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                      start_new_session=True)
@@ -686,11 +770,19 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
         for wi, win in enumerate(wins):
             if wi == 0 and ci > 0 and placed:
                 anchor = placed[-1][0]
-                dispatch(f'hl.dsp.focus({{ window = "address:{anchor["address"]}" }})')
+                address = safe_window_address(anchor.get("address"))
+                if not address:
+                    problems.append("invalid Hyprland window address")
+                    continue
+                dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
                 dispatch('hl.dsp.layout("preselect r")')
             elif wi > 0:
                 anchor = col_clients[-1]
-                dispatch(f'hl.dsp.focus({{ window = "address:{anchor["address"]}" }})')
+                address = safe_window_address(anchor.get("address"))
+                if not address:
+                    problems.append("invalid Hyprland window address")
+                    continue
+                dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
                 dispatch('hl.dsp.layout("preselect d")')
 
             label = str(win.get("term") or win.get("app") or "terminal").split()[0]
@@ -704,7 +796,11 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                 log(f"timeout waiting for {label}")
                 continue
             if client["workspace"]["id"] != number:
-                dispatch(f'hl.dsp.window.move({{ window = "address:{client["address"]}", '
+                address = safe_window_address(client.get("address"))
+                if not address:
+                    problems.append("invalid Hyprland window address")
+                    continue
+                dispatch(f'hl.dsp.window.move({{ window = "address:{address}", '
                          f'workspace = "{number}", follow = false }})')
                 time.sleep(0.15)
             if client.get("floating") and not win.get("float"):
@@ -712,8 +808,12 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                 # TUIs, 1Password, media players. In a setup that leaves a
                 # hole in the column, so put the window back in the layout.
                 # `float = true` on the window opts out and keeps it floating.
+                address = safe_window_address(client.get("address"))
+                if not address:
+                    problems.append("invalid Hyprland window address")
+                    continue
                 dispatch(f'hl.dsp.window.float({{ action = "off", '
-                         f'window = "address:{client["address"]}" }})')
+                         f'window = "address:{address}" }})')
                 time.sleep(0.2)
                 client = next((c for c in clients()
                                if c["address"] == client["address"]), client)
@@ -878,8 +978,11 @@ def apply_sizes(number: int, columns: list[dict], placed: list[list[dict]]) -> N
             target_h = target_heights[wi]
             if target_w < 60 or target_h < 60:
                 continue
+            address = safe_window_address(c.get("address"))
+            if not address:
+                continue
             dispatch(f'hl.dsp.window.resize({{ x = {int(target_w)}, y = {int(target_h)}, '
-                     f'window = "address:{c["address"]}" }})')
+                     f'window = "address:{address}" }})')
             time.sleep(0.08)
             live = {c2["address"]: c2 for c2 in clients() if c2["workspace"]["id"] == number}
 
@@ -893,6 +996,7 @@ def normalize_service(spec) -> dict:
         s = spec.strip()
         if re.fullmatch(r"[\w@.\\-]+\.(service|socket|target|timer|scope|path)", s) or user_unit_exists(s):
             return {"unit": s}
+        parse_command(s, "service run")
         return {"run": s}
     return dict(spec or {})
 
@@ -936,9 +1040,10 @@ def start_services(specs: list, report) -> list[dict]:
                                    capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
             except subprocess.TimeoutExpired:
                 r = subprocess.CompletedProcess([], 124, "", "timed out")
-            log(f"systemctl --user start {unit}: rc={r.returncode} {r.stderr.strip()}")
+            log(f"systemd service start: {unit} rc={r.returncode}")
             started.append({"unit": unit, "ok": r.returncode == 0,
-                            "owned": r.returncode == 0, "error": r.stderr.strip()})
+                            "owned": r.returncode == 0,
+                            "error": "service failed to start" if r.returncode else ""})
         elif spec.get("run"):
             workdir = os.path.expanduser(str(spec.get("dir") or "")) or None
             if workdir and not os.path.isdir(workdir):
@@ -946,13 +1051,13 @@ def start_services(specs: list, report) -> list[dict]:
             label = str(spec["run"]).split()[0] if str(spec["run"]).split() else "service"
             report(f"starting {label}")
             try:
-                p = subprocess.Popen(["bash", "-lc", spec["run"]], cwd=workdir,
+                p = subprocess.Popen(parse_command(spec["run"], "service run"), cwd=workdir,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      stdin=subprocess.DEVNULL, start_new_session=True)
             except Exception:
                 stop_services(started, report)
                 raise
-            log(f"run service pid={p.pid}: {spec['run']}")
+            log(f"service started: {label}")
             started.append({"run": spec["run"], "pid": p.pid, "stop": spec.get("stop", ""),
                             "dir": spec.get("dir", ""), "ok": True, "owned": True})
     return started
@@ -1016,7 +1121,7 @@ def stop_services(started: list[dict], report) -> None:
         elif spec.get("stop"):
             report("stopping service")
             try:
-                subprocess.run(["bash", "-lc", spec["stop"]],
+                subprocess.run(parse_command(spec["stop"], "service stop"),
                                cwd=os.path.expanduser(str(spec.get("dir") or "")) or None,
                                capture_output=True, timeout=COMMAND_TIMEOUT)
             except subprocess.TimeoutExpired:
@@ -1042,7 +1147,9 @@ def close_windows(grace: float, force: bool, report) -> list[dict]:
         return []
     report(f"closing {len(targets)} window{'s' if len(targets) != 1 else ''}")
     for c in targets:
-        dispatch(f'hl.dsp.window.close({{ window = "address:{c["address"]}" }})')
+        address = safe_window_address(c.get("address"))
+        if address:
+            dispatch(f'hl.dsp.window.close({{ window = "address:{address}" }})')
 
     deadline = time.time() + grace
     while time.time() < deadline:
@@ -1229,7 +1336,7 @@ def cmd_load(args) -> int:
         started_services = services
         failed_services = [s for s in services if not s.get("ok", True)]
         if failed_services:
-            names = ", ".join(s.get("unit") or s.get("run", "service") for s in failed_services)
+            names = ", ".join(s.get("unit") or "configured command" for s in failed_services)
             stop_services([s for s in services if s not in failed_services], report)
             save_state(phase="error", loader_pid=0, error=f"Could not start: {names}", services=services)
             notify("Setup switch failed", f"Could not start: {names}", replace=True, urgency="critical")
@@ -1273,11 +1380,12 @@ def cmd_load(args) -> int:
         notify(f"{setup['name']} loaded", loaded_body, replace=True,
                urgency="normal" if failed else "low")
         return 0
-    except Exception as e:  # never leave the panel stuck on "loading"
-        log(f"FATAL {e!r}")
+    except Exception:  # never leave the panel stuck on "loading"
+        log("load failed unexpectedly")
         stop_services(started_services, report)
-        save_state(phase="error", loader_pid=0, step="", error=str(e), recoverable=False)
-        notify("Setup switch failed", str(e), replace=True, urgency="critical")
+        safe_error = "Setup switch failed unexpectedly"
+        save_state(phase="error", loader_pid=0, step="", error=safe_error, recoverable=False)
+        notify("Setup switch failed", safe_error, replace=True, urgency="critical")
         return 1
     finally:
         release_lock()
@@ -1689,9 +1797,15 @@ def window_label(win: dict) -> str:
     """The one word that names a window in the menu: `codex`, `chromium`."""
     if "app" in win:
         raw = str(win.get("app") or "")
-        return Path(shlex.split(raw)[0]).name if raw.strip() else "app"
+        try:
+            return Path(shlex.split(raw)[0]).name if raw.strip() else "app"
+        except ValueError:
+            return "app"
     cmd = str(win.get("term") or "").strip()
-    return Path(shlex.split(cmd)[0]).name if cmd else "shell"
+    try:
+        return Path(shlex.split(cmd)[0]).name if cmd else "shell"
+    except ValueError:
+        return "terminal"
 
 
 def setup_shape(setup: dict) -> tuple[list, int]:
@@ -1801,6 +1915,7 @@ name = "Work"
 icon = ""
 # Systemd user units, or plain commands to run in the background.
 # services = ["docker-desktop", { run = "npm run dev", dir = "~/Work/app", stop = "pkill -f 'npm run dev'" }]
+# Commands are parsed as arguments and launched directly; shell operators are not interpreted.
 services = []
 
   [[setups.workspaces]]

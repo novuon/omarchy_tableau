@@ -98,7 +98,7 @@ services = []
 
 | Key | Meaning |
 | --- | --- |
-| `term` | Run a command in the configured terminal. Use `""` for a shell. |
+| `term` | Open the configured terminal directly into a command. Use `""` for a shell prompt. |
 | `app` | Run an application with its arguments. |
 | `dir` | Working directory. |
 | `class` | Window class, when it differs from the command. |
@@ -134,7 +134,9 @@ If the display is not connected, Tableau uses the focused monitor.
 
 ### Services
 
-Services can be systemd user units or background commands:
+Services can be systemd user units or background commands. Commands are parsed
+as arguments and launched directly; shell operators and pipelines are not
+interpreted.
 
 ```toml
 services = [

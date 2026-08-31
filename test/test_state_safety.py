@@ -105,6 +105,95 @@ with tempfile.TemporaryDirectory() as tmp:
     else:
         raise AssertionError("non-finite configuration should be rejected")
 
+    # Malformed strings must become configuration errors, not status/menu crashes.
+    config_path.write_text(
+        "[[setups]]\n"
+        "name = 42\n"
+    )
+    try:
+        cli.load_config()
+    except cli.ConfigError:
+        pass
+    else:
+        raise AssertionError("non-string setup name should be rejected")
+
+    config_path.write_text(
+        "[[setups]]\n"
+        'name = "Broken"\n'
+        '  [[setups.workspaces]]\n'
+        "  number = 1\n"
+        '  columns = [{ windows = [{ app = "unterminated } ] }]\n'
+    )
+    try:
+        cli.load_config()
+    except cli.ConfigError:
+        pass
+    else:
+        raise AssertionError("malformed command quoting should be rejected")
+
+    config_path.write_text(
+        "[[setups]]\n"
+        'name = "Huge"\n'
+        "  [[setups.workspaces]]\n"
+        "  number = 1\n"
+        "  columns = [" + ",".join("{ windows = [] }" for _ in range(cli.MAX_COLUMNS + 1)) + "]\n"
+    )
+    try:
+        cli.load_config()
+    except cli.ConfigError:
+        pass
+    else:
+        raise AssertionError("oversized column count should be rejected")
+
+    # Service commands are argv commands: shell syntax is not interpreted.
+    config_path.write_text("[options]\n")
+    seen = {}
+
+    class FakeProcess:
+        pid = 12345
+
+    original_popen = cli.subprocess.Popen
+    def fake_popen(argv, **kwargs):
+        seen["argv"] = argv
+        return FakeProcess()
+    cli.subprocess.Popen = fake_popen
+    try:
+        cli.start_services([{"run": "echo hi; touch SHOULD_NOT_RUN"}], lambda _: None)
+    finally:
+        cli.subprocess.Popen = original_popen
+    assert seen["argv"] == ["echo", "hi;", "touch", "SHOULD_NOT_RUN"]
+
+    # Terminal entries also go straight to xdg-terminal-exec: the configured
+    # command is not wrapped in a shell and does not wait for a prompt.
+    seen.clear()
+    cli.launch_prefix = lambda: []
+    cli.subprocess.Popen = fake_popen
+    try:
+        cli.spawn_window({"term": "echo hi; touch SHOULD_NOT_RUN"})
+    finally:
+        cli.subprocess.Popen = original_popen
+    assert seen["argv"] == [
+        "xdg-terminal-exec", "--app-id=org.omarchy.tableau.echo",
+        "-e", "echo", "hi;", "touch", "SHOULD_NOT_RUN",
+    ]
+    # Failure details must not expose command output or exception internals
+    # through persisted state.
+    original_run = cli.subprocess.run
+    def failed_systemctl(*args, **kwargs):
+        return cli.subprocess.CompletedProcess([], 1, "", "secret internal detail")
+    cli.subprocess.run = failed_systemctl
+    try:
+        service_result = cli.start_services([{"unit": "safe.service"}], lambda _: None)
+    finally:
+        cli.subprocess.run = original_run
+    assert service_result[0]["error"] == "service failed to start"
+    assert cli.safe_window_address("0xabc123") == "0xabc123"
+    assert cli.safe_window_address('0xabc"; dangerous') is None
+
+    # Log output is sanitized and stops growing after its bounded budget.
+    cli.log("line\nforged\x00" + "x" * cli.MAX_LOG_LINE)
+    assert cli.LOG_PATH.stat().st_size <= cli.MAX_LOG_BYTES
+
     # Backup retention is bounded rather than growing on every edit.
     config_path.write_text("safe")
     for _ in range(cli.MAX_BACKUPS + 3):
