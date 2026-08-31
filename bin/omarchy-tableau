@@ -1826,7 +1826,7 @@ services = []
     { width = 1, windows = [{ app = "nautilus" }] },
     { width = 1, windows = [
       { term = "", height = 1 },
-      { term = "btop", height = 1 },
+      { term = "", height = 1 },
     ] },
   ]
 """
