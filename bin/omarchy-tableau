@@ -709,11 +709,15 @@ def spawn_window(win: dict) -> None:
             argv.append(f"--dir={workdir}")
         if cmd:
             argv += ["-e", *parse_command(cmd, "window term")]
+        # Capture omits `dir` when a terminal lived in $HOME, so HOME is
+        # the default -- never the loader's own working directory.
+        cwd = workdir or str(HOME)
     else:
         argv = [*launch_prefix(), *parse_command(str(win["app"]), "window app")]
+        cwd = workdir
 
     log(f"spawn: {Path(argv[-1]).name if argv else 'window'}")
-    subprocess.Popen(argv, cwd=workdir, stdout=subprocess.DEVNULL,
+    subprocess.Popen(argv, cwd=cwd, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                      start_new_session=True)
 
@@ -792,9 +796,12 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
             wait = float(win.get("wait") or opts.get("window_wait") or DEFAULT_WINDOW_WAIT)
             client = wait_for_window(before, wait, str(win.get("class") or ""))
             if client is None:
+                # The docstring's contract: a window that never maps aborts
+                # its workspace. Pressing on used to crash on the next
+                # window's anchor below and take the whole load with it.
                 problems.append(f"{label} never opened")
                 log(f"timeout waiting for {label}")
-                continue
+                return problems
             if client["workspace"]["id"] != number:
                 address = safe_window_address(client.get("address"))
                 if not address:
@@ -1491,6 +1498,19 @@ def terminal_spec(c: dict, argv: list[str]) -> dict:
             name = Path(leaf_argv[0]).name if leaf_argv else ""
             if name and name not in SHELLS and name not in TERMINAL_EXES:
                 cmd = shlex.join(leaf_argv)
+                if len(leaf_argv) == 1 and " " in leaf_argv[0]:
+                    # A rewritten process title (puma, sidekiq, ...) exposes
+                    # one argv element with spaces; it can never be run back.
+                    # Keep a real spaced path as-is, keep the leading word
+                    # when it names an executable, else fall back to a plain
+                    # shell in the same directory.
+                    blob = leaf_argv[0]
+                    if not (os.path.isfile(blob) and os.access(blob, os.X_OK)):
+                        try:
+                            first = shlex.split(blob)[0]
+                        except (ValueError, IndexError):
+                            first = ""
+                        cmd = first if (first and has(first)) else ""
             workdir = workdir or proc_cwd(leaf_pid)
 
     spec["term"] = cmd
