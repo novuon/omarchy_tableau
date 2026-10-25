@@ -13,6 +13,7 @@ python3 test/test_state_safety.py
 python3 test/test_first_run.py
 python3 test/test_rc2_compat.py
 python3 test/test_save_on_switch.py
+python3 test/test_load_resilience.py
 
 # The generated starter config must remain usable on a fresh Omarchy install.
 # Keep this guard close to the source template so optional developer tools do
