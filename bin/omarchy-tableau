@@ -89,7 +89,7 @@ TERMINAL_CLASSES = {
 
 DEFAULT_GRACE = 8          # seconds a window gets to close politely
 DEFAULT_WINDOW_WAIT = 20   # seconds a window gets to appear after launching
-LAYOUT_PLAN_VERSION = 2    # default monitor assignment changed to the main screen
+LAYOUT_PLAN_VERSION = 3    # implicit workspaces are no longer pinned to a monitor
 
 
 # --------------------------------------------------------------------------
@@ -606,31 +606,33 @@ def max_columns(width: int) -> int:
 def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict:
     """Decide which workspace lands on which screen, and how many columns.
 
-    Empty monitor preferences use the focused monitor (or the first monitor
-    when Hyprland has not reported one). An explicit monitor preference is
-    matched against both its connector name and description. A remembered
-    plan wins only when it uses the current assignment rules and every screen
-    it names is still here.
+    A workspace without a monitor preference is not pinned: it stays wherever
+    Hyprland's own workspace rules (the user's config, hyprmoncfg, ...) put it,
+    and only its column count is sized to the focused monitor. An explicit
+    monitor preference is matched against both its connector name and
+    description, and falls back to the focused monitor. A remembered plan wins
+    only when it uses the current assignment rules and every screen it names is
+    still here.
     """
     names = [m["name"] for m in mons]
     if remembered and remembered.get("version") == LAYOUT_PLAN_VERSION:
-        wanted = {w.get("monitor") for w in remembered.get("workspaces", [])}
-        if wanted and wanted.issubset(set(names)):
+        wanted = {w.get("monitor") for w in remembered.get("workspaces", []) if w.get("monitor")}
+        if wanted.issubset(set(names)):
             return remembered
 
     workspaces = setup.get("workspaces") or []
     main = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
     plan_ws = []
     for i, ws in enumerate(workspaces):
-        # Do not distribute implicit workspaces: the main display is the
-        # predictable default. Use `monitor = "DP-2"` in the workspace block
-        # when a workspace belongs on another screen.
+        # Pin a workspace only when the config asks for it with `monitor = "DP-2"`.
+        # Pinning implicit workspaces would override the user's own workspace
+        # rules every time a setup loads.
         pref = ws.get("monitor")
         mon = main
         if pref:
             mon = next((m for m in mons if pref.lower() in (m["name"] + " " + str(m.get("description", ""))).lower()), None)
             mon = mon or main
-        mon_name = mon["name"] if mon else ""
+        mon_name = mon["name"] if pref and mon else ""
         width = logical_size(mon)[0] if mon else 1920
         declared = len(ws.get("columns") or []) or 1
         plan_ws.append({

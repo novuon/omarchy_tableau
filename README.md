@@ -132,6 +132,9 @@ Add `monitor` to a workspace to request a display:
 
 If the display is not connected, Tableau uses the focused monitor.
 
+Without `monitor`, Tableau does not pin the workspace: it opens wherever your
+own Hyprland workspace rules put it, so tools like hyprmoncfg keep working.
+
 ### Services
 
 Services can be systemd user units or background commands. Commands are parsed
