@@ -160,7 +160,9 @@ omarchy-tableau forget
 ```
 
 Tableau opens windows one at a time. A missing application is reported in the
-menu. If a window refuses to close, Tableau pauses and asks what to do.
+menu. If a window does not appear before its timeout, Tableau stops building
+that workspace and continues with the next workspace. If a window refuses to
+close, Tableau pauses and asks what to do.
 
 If a load is interrupted by a crash or shell restart, Tableau marks it as
 recoverable and offers **Restore** and **Start clean** in the menu. It never

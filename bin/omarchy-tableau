@@ -794,7 +794,10 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
             if client is None:
                 problems.append(f"{label} never opened")
                 log(f"timeout waiting for {label}")
-                continue
+                # Later splits depend on this window being present. Stop this
+                # workspace rather than using a missing anchor or resizing an
+                # incomplete layout; cmd_load can still build other workspaces.
+                return problems
             if client["workspace"]["id"] != number:
                 address = safe_window_address(client.get("address"))
                 if not address:
