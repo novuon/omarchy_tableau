@@ -58,7 +58,15 @@ Keyboard controls:
 - `x`: delete the selected tableau
 - Escape: close the menu
 
-Open the centered Tableau switcher at any time with `SUPER + ALT + T`.
+Open Tableau from its icon in the bar. Tableau does not install a global
+shortcut. Omarchy already uses `SUPER + T` to toggle floating and
+`SUPER + CTRL + ALT + T` to show the time, and nothing in this plugin binds
+`SUPER + ALT + T`. To open the menu from the keyboard, add a personal
+binding in `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + ALT + T", "Tableau", "omarchy-shell novuon.tableau toggle")
+```
 
 ## Configuration
 
@@ -104,7 +112,7 @@ services = []
 | `class` | Window class, when it differs from the command. |
 | `height` | Relative height inside a column. |
 | `width` | Relative width of a column. |
-| `float` | Keep the window floating. |
+| `float` | Keep this window floating. A window that is floating only because its workspace layout is floating is not saved this way. |
 | `wait` | Seconds to wait for the window. Default: 20. |
 
 Use the default Omarchy helpers when possible:
@@ -121,7 +129,12 @@ fresh Omarchy install without optional developer applications.
 
 ### Monitors
 
-Add `monitor` to a workspace to request a display:
+`number` is that monitor's own workspace, from 1 to 10. Omarchy 4.5 gives
+every monitor a block of ten Hyprland workspaces — the first monitor 1–10,
+the next 11–20, and so on — and remembers the assignment in
+`~/.local/state/omarchy/monitor-workspaces`. Tableau maps the number into
+the named monitor's block, so this is the third workspace on `DP-2`, not
+Hyprland workspace 3:
 
 ```toml
   [[setups.workspaces]]
@@ -130,7 +143,25 @@ Add `monitor` to a workspace to request a display:
   columns = [{ width = 1, windows = [{ term = "" }] }]
 ```
 
+The same number can be used on another monitor. A config from before
+per-monitor workspaces still loads. A number that is already the Hyprland
+id inside that monitor's block is left alone, and with no
+`monitor-workspaces` file the number is the Hyprland id, as it used to be.
+
 If the display is not connected, Tableau uses the focused monitor.
+
+### Layout and opacity
+
+Tableau builds columns with dwindle splits. A workspace set to scrolling or
+floating, including the default from Appearance, keeps that layout. Tableau
+does not force it back to dwindle. On a floating workspace, windows the
+layout floated are captured as part of the desk and are not written as
+`float = true`.
+
+Tableau does not set window opacity. Restored applications stay at
+Omarchy's opaque default. Terminals Tableau opens use an `org.omarchy.tableau.*`
+app id, which still matches Omarchy's terminal tag, so they keep terminal
+transparency and do not match the float rules in `system.lua`.
 
 ### Services
 

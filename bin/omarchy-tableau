@@ -16,6 +16,8 @@ Design notes worth knowing before changing anything:
   next split goes (`preselect`), spawn the next. Sizes are corrected once at
   the end with an exact resize. This is why loading is sequential and why a
   window that never maps aborts its workspace instead of silently skewing it.
+  A workspace the user has set to scrolling or floating keeps that layout;
+  Tableau does not force it back to dwindle.
 * Nothing is ever force-killed by default. Closing asks politely and reports
   what refused, because an app refusing to close is usually an app with
   unsaved work asking a question.
@@ -48,6 +50,12 @@ CONFIG_PATH = Path(os.environ.get("OMARCHY_TABLEAU_CONFIG", HOME / ".config/omar
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy/tableau"
 STATE_PATH = STATE_DIR / "state.json"
 LAYOUTS_PATH = STATE_DIR / "layouts.json"
+# Omarchy 4.5: one block of ten Hyprland workspaces per monitor. The connector
+# in this file is what the bar and the keybinds use; Tableau maps config
+# numbers (1-10 on a named monitor) into that block.
+MONITOR_WORKSPACES_PATH = STATE_DIR.parent / "monitor-workspaces"
+WORKSPACE_LAYOUTS_DIR = STATE_DIR.parent / "workspace-layouts"
+WORKSPACE_SLOTS = 10
 LOCK_PATH = STATE_DIR / "lock"
 LOG_PATH = STATE_DIR / "load.log"
 MAX_STATE_BYTES = 64 * 1024
@@ -71,14 +79,26 @@ WINDOW_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]+$")
 
 EMPTY = "Empty"  # the built-in do-nothing setup: a bare Omarchy desktop
 
-# App-id for the terminals we spawn. Deliberately *not* `org.omarchy.<cmd>`:
-# Omarchy floats and centres its own TUI app-ids -- the rule in
-# hypr/apps/system.lua matches `org.omarchy.btop|org.omarchy.terminal|...` in
-# full -- so a setup built under those ids came up as floating 875x600 boxes
-# instead of a tiled column. The extra `.setups.` misses that rule while still
-# matching `org.omarchy.*`, which is what tags a window as a terminal for
-# theming.
+# App-id for the terminals we spawn. The `org.omarchy.` prefix matches the
+# terminal tag in default/hypr/apps/terminals.lua (`org\.omarchy\..*`), which
+# is what themes a window as a terminal and, on Omarchy 4.5, opts it into
+# terminal transparency. It must not match the float rules in
+# default/hypr/apps/system.lua. Those patterns are unanchored and "." is any
+# character, so a leaf of `imv` or `mpv` would still open as an 875×600 float.
+# `avoid_omarchy_float_rule` breaks that match without leaving the prefix.
 APP_ID_PREFIX = "org.omarchy.tableau."
+
+# The class regex from default/hypr/apps/system.lua on v4.5.0-rc2, plus the
+# dedicated about/screensaver rules that sit beside it.
+OMARCHY_SYSTEM_FLOAT_RE = re.compile(
+    "(org.omarchy.btop|org.omarchy.terminal|org.omarchy.bash|"
+    "org.codeberg.dnkl.foot|org.gnome.NautilusPreviewer|org.gnome.Evince|"
+    "Omarchy|About|TUI.float|imv|mpv)"
+)
+OMARCHY_DEDICATED_FLOAT_RES = (
+    re.compile(r"org.omarchy.about"),
+    re.compile(r"org.omarchy.screensaver"),
+)
 
 # Terminals whose window is really "a shell running something". Used only when
 # reading the desktop back (save), never when building it.
@@ -89,7 +109,7 @@ TERMINAL_CLASSES = {
 
 DEFAULT_GRACE = 8          # seconds a window gets to close politely
 DEFAULT_WINDOW_WAIT = 20   # seconds a window gets to appear after launching
-LAYOUT_PLAN_VERSION = 2    # default monitor assignment changed to the main screen
+LAYOUT_PLAN_VERSION = 3    # plans store Hyprland ids inside each monitor's block of ten
 
 
 # --------------------------------------------------------------------------
@@ -457,7 +477,7 @@ def load_config() -> dict:
             raise ConfigError(f"{s['name']}: workspaces must be a list")
         if len(workspaces) > MAX_WORKSPACES:
             raise ConfigError(f"{s['name']}: too many workspaces")
-        numbers = []
+        seen_numbers = set()
         for w in workspaces:
             if not isinstance(w, dict):
                 raise ConfigError(f"{s['name']}: every workspace must be a table")
@@ -465,13 +485,17 @@ def load_config() -> dict:
                 number = int(w.get("number") or 0)
             except (TypeError, ValueError):
                 raise ConfigError(f"{s['name']}: workspace number must be an integer")
-            if number < 1 or number in numbers:
-                raise ConfigError(f"{s['name']}: workspace numbers must be unique positive integers")
-            if number > 10000:
-                raise ConfigError(f"{s['name']}: workspace number is too large")
-            numbers.append(number)
             if "monitor" in w and not isinstance(w["monitor"], str):
                 raise ConfigError(f"{s['name']}: monitor must be a string")
+            # The same slot may name a different workspace on another monitor.
+            # Omarchy 4.5 maps each monitor's 1-10 into its own block of ten.
+            monitor_key = str(w.get("monitor") or "").strip().casefold()
+            identity = (number, monitor_key)
+            if number < 1 or identity in seen_numbers:
+                raise ConfigError(f"{s['name']}: workspace numbers must be unique on each monitor")
+            if number > 10000:
+                raise ConfigError(f"{s['name']}: workspace number is too large")
+            seen_numbers.add(identity)
             columns = w.get("columns") or []
             if not isinstance(columns, list):
                 raise ConfigError(f"{s['name']}: columns must be a list")
@@ -589,6 +613,253 @@ def find_setup(cfg: dict, name: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------
+# per-monitor workspaces and layout modes
+# --------------------------------------------------------------------------
+
+def load_monitor_blocks() -> dict[str, int]:
+    """Connector -> block index from Omarchy's monitor-workspaces file.
+
+    Empty when the file is absent, which is every Omarchy before per-monitor
+    workspaces: config numbers are then Hyprland ids, unchanged.
+    """
+    text = read_user_file(MONITOR_WORKSPACES_PATH, 64 * 1024)
+    if not text:
+        return {}
+    blocks: dict[str, int] = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            block = int(parts[0])
+        except ValueError:
+            continue
+        connector = parts[1].strip()
+        if connector and block >= 0:
+            blocks[connector] = block
+    return blocks
+
+
+def workspace_slot(workspace_id: int) -> int:
+    return (int(workspace_id) - 1) % WORKSPACE_SLOTS + 1
+
+
+def workspace_block(workspace_id: int) -> int:
+    return (int(workspace_id) - 1) // WORKSPACE_SLOTS
+
+
+def block_bounds(block: int) -> tuple[int, int]:
+    start = block * WORKSPACE_SLOTS + 1
+    return start, start + WORKSPACE_SLOTS - 1
+
+
+def connector_for_block(block: int, blocks: dict[str, int]) -> str:
+    for connector, owned in blocks.items():
+        if owned == block:
+            return connector
+    return ""
+
+
+def resolve_workspace_number(number: int, monitor: str, explicit_monitor: bool,
+                             blocks: dict[str, int] | None = None) -> tuple[int, str]:
+    """Map a config workspace number onto a Hyprland id and connector.
+
+    `number = 3` with `monitor = "DP-2"` is the third workspace on that
+    monitor. On Omarchy 4.5 that is Hyprland workspace `block * 10 + 3`.
+    A number that already sits inside the monitor's block is kept, so a
+    config saved before this mapping still opens the same workspace. With
+    no monitor-workspaces file the number is the Hyprland id, as before.
+    """
+    number = int(number)
+    monitor = monitor or ""
+    if blocks is None:
+        blocks = load_monitor_blocks()
+    if not blocks or number < 1:
+        return number, monitor
+
+    if monitor in blocks:
+        start, end = block_bounds(blocks[monitor])
+        if 1 <= number <= WORKSPACE_SLOTS:
+            return blocks[monitor] * WORKSPACE_SLOTS + number, monitor
+        if start <= number <= end:
+            return number, monitor
+        if explicit_monitor:
+            return blocks[monitor] * WORKSPACE_SLOTS + workspace_slot(number), monitor
+
+    if number > WORKSPACE_SLOTS and not explicit_monitor:
+        owner = connector_for_block(workspace_block(number), blocks)
+        if owner:
+            return number, owner
+    return number, monitor
+
+
+def capture_workspace_number(workspace_id: int, monitor: str, blocks: dict[str, int]) -> int:
+    """Store a workspace as that monitor's 1-10 slot when it owns the id."""
+    workspace_id = int(workspace_id)
+    if monitor and monitor in blocks and workspace_block(workspace_id) == blocks[monitor]:
+        return workspace_slot(workspace_id)
+    return workspace_id
+
+
+def plan_respects_blocks(plan: dict, blocks: dict[str, int]) -> bool:
+    """A remembered plan is stale when a monitor's block has moved under it."""
+    if not blocks:
+        return True
+    for workspace in plan.get("workspaces") or []:
+        if not isinstance(workspace, dict):
+            return False
+        monitor = str(workspace.get("monitor") or "")
+        if monitor not in blocks:
+            continue
+        try:
+            number = int(workspace.get("number") or 0)
+        except (TypeError, ValueError):
+            return False
+        start, end = block_bounds(blocks[monitor])
+        if not (start <= number <= end):
+            return False
+    return True
+
+
+def _layout_mode(path: Path) -> str:
+    text = read_user_file(path, 4096)
+    if not text:
+        return ""
+    match = re.search(r'\b(?:mode|default)\s*=\s*"([a-z]+)"', text)
+    if not match:
+        return ""
+    mode = match.group(1)
+    if mode in ("dwindle", "scrolling", "master", "floating"):
+        return mode
+    return ""
+
+
+def configured_layout() -> str:
+    """Hyprland's general layout, when no workspace mode file names one."""
+    option = hypr_json("getoption", "general:layout")
+    if isinstance(option, dict):
+        value = str(option.get("str") or "").strip().lower()
+        if value in ("dwindle", "scrolling", "master"):
+            return value
+    return "dwindle"
+
+
+def read_workspace_mode(workspace_id: int) -> str:
+    """dwindle, scrolling, master, or floating for this Hyprland workspace."""
+    specific = _layout_mode(WORKSPACE_LAYOUTS_DIR / f"{int(workspace_id)}.lua")
+    if specific:
+        return specific
+    default = _layout_mode(WORKSPACE_LAYOUTS_DIR / "default.lua")
+    if default:
+        return default
+    return configured_layout()
+
+
+def workspace_rule_lua(number: int, monitor: str, mode: str) -> str:
+    """Workspace rule that keeps a user-chosen layout.
+
+    Floating is not a Hyprland layout. Naming dwindle on a floating or
+    scrolling workspace would replace the layout the user picked, so the
+    rule only sets a tiled layout when that is the one in force.
+    """
+    fields = [f"workspace = {int(number)}"]
+    if mode in ("dwindle", "scrolling", "master"):
+        fields.append(f"layout = {json.dumps(mode)}")
+    if monitor:
+        fields.append(f"monitor = {json.dumps(monitor)}")
+    return "hl.workspace_rule({ " + ", ".join(fields) + " })"
+
+
+def window_tags(client: dict) -> set[str]:
+    raw = client.get("tags", None)
+    if raw is None:
+        raw = client.get("tag", [])
+    parts: list[str] = []
+    if isinstance(raw, str):
+        parts = [part for part in re.split(r"[\s,]+", raw) if part]
+    elif isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("tag") or ""
+                if name:
+                    parts.append(str(name))
+    return {part.strip().rstrip("*") for part in parts if str(part).strip()}
+
+
+def mode_floated_window(client: dict) -> bool:
+    """True when the floating-workspace mode floated this window.
+
+    `omarchy-mode-floated` is the claim. `omarchy-mode-opened` is the same
+    window in the moment before that claim lands.
+    """
+    tags = window_tags(client)
+    return "omarchy-mode-floated" in tags or "omarchy-mode-opened" in tags
+
+
+def should_unfloat(client: dict, win: dict, mode: str) -> bool:
+    """Put an app-rule float back into a tiled column.
+
+    A window floating because the workspace layout is floating stays
+    floating. `float = true` on the window opts out either way.
+    """
+    if not client.get("floating") or win.get("float"):
+        return False
+    if mode == "floating" or mode_floated_window(client):
+        return False
+    return True
+
+
+def matches_omarchy_float_rule(app_id: str) -> bool:
+    if OMARCHY_SYSTEM_FLOAT_RE.search(app_id):
+        return True
+    return any(rule.search(app_id) for rule in OMARCHY_DEDICATED_FLOAT_RES)
+
+
+def avoid_omarchy_float_rule(app_id: str) -> str:
+    """Break an unanchored system.lua float match without leaving org.omarchy.*."""
+    for _ in range(8):
+        if not matches_omarchy_float_rule(app_id):
+            return app_id
+        match = OMARCHY_SYSTEM_FLOAT_RE.search(app_id)
+        if match is None:
+            for rule in OMARCHY_DEDICATED_FLOAT_RES:
+                match = rule.search(app_id)
+                if match:
+                    break
+        if match is None or match.end() <= match.start():
+            return app_id
+        mid = match.start() + max(1, (match.end() - match.start()) // 2)
+        app_id = app_id[:mid] + "-" + app_id[mid:]
+    return app_id
+
+
+_NON_TERMINAL_CLASS_RE = re.compile(
+    r"(screensaver|captive[-_ ]?portal|chrome-ping\.omacom\.io)",
+    re.IGNORECASE,
+)
+
+
+def is_non_terminal_class(cls: str) -> bool:
+    """Omarchy classes that are not desk terminals.
+
+    The screensaver is a fullscreen terminal binary, and the captive portal
+    is a browser window. Neither should be saved or restored as a shell.
+    """
+    return bool(_NON_TERMINAL_CLASS_RE.search(cls or ""))
+
+
+def home_workspace_id(mons: list[dict]) -> int:
+    """The focused monitor's first workspace, or 1 when blocks are not in use."""
+    main = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
+    if not main:
+        return 1
+    hypr_id, _ = resolve_workspace_number(1, str(main.get("name") or ""), True, load_monitor_blocks())
+    return hypr_id
+
+
+# --------------------------------------------------------------------------
 # layout resolution
 # --------------------------------------------------------------------------
 
@@ -609,11 +880,18 @@ def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict
     Empty monitor preferences use the focused monitor (or the first monitor
     when Hyprland has not reported one). An explicit monitor preference is
     matched against both its connector name and description. A remembered
-    plan wins only when it uses the current assignment rules and every screen
-    it names is still here.
+    plan wins only when it uses the current assignment rules, every screen
+    it names is still here, and each workspace id still belongs to that
+    monitor's block.
+
+    Config `number` values are that monitor's own workspace, 1-10, once
+    Omarchy is writing monitor-workspaces. The plan stores the Hyprland id
+    inside the block so the rest of the loader can keep comparing ids.
     """
     names = [m["name"] for m in mons]
-    if remembered and remembered.get("version") == LAYOUT_PLAN_VERSION:
+    blocks = load_monitor_blocks()
+    if (remembered and remembered.get("version") == LAYOUT_PLAN_VERSION
+            and plan_respects_blocks(remembered, blocks)):
         wanted = {w.get("monitor") for w in remembered.get("workspaces", [])}
         if wanted and wanted.issubset(set(names)):
             return remembered
@@ -626,16 +904,24 @@ def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict
         # predictable default. Use `monitor = "DP-2"` in the workspace block
         # when a workspace belongs on another screen.
         pref = ws.get("monitor")
-        mon = main
+        matched = None
         if pref:
-            mon = next((m for m in mons if pref.lower() in (m["name"] + " " + str(m.get("description", ""))).lower()), None)
-            mon = mon or main
+            matched = next((m for m in mons if str(pref).lower() in (m["name"] + " " + str(m.get("description", ""))).lower()), None)
+        # A named monitor that is not connected falls back to the focused
+        # one, but that fallback is not an explicit block assignment: a
+        # stored Hyprland id keeps its own monitor when the blocks file
+        # still knows it.
+        explicit = matched is not None
+        mon = matched or main
         mon_name = mon["name"] if mon else ""
+        config_number = int(ws.get("number") or (i + 1))
+        hypr_id, mon_name = resolve_workspace_number(config_number, mon_name, explicit, blocks)
         width = logical_size(mon)[0] if mon else 1920
         declared = len(ws.get("columns") or []) or 1
         plan_ws.append({
             "index": i,
-            "number": int(ws.get("number") or (i + 1)),
+            "number": hypr_id,
+            "slot": config_number if 1 <= config_number <= WORKSPACE_SLOTS else workspace_slot(hypr_id),
             "monitor": mon_name,
             "columns": max(1, min(declared, max_columns(width))),
         })
@@ -688,12 +974,14 @@ def launch_prefix() -> list[str]:
 def app_id_for(cmd: str) -> str:
     """The app-id a terminal running `cmd` gets, when the setup names none."""
     if not cmd:
-        return APP_ID_PREFIX + "terminal"
-    try:
-        leaf = Path(shlex.split(cmd)[0]).name
-    except ValueError:
         leaf = "terminal"
-    return APP_ID_PREFIX + (re.sub(r"[^A-Za-z0-9_-]", "-", leaf) or "terminal")
+    else:
+        try:
+            leaf = Path(shlex.split(cmd)[0]).name
+        except ValueError:
+            leaf = "terminal"
+        leaf = re.sub(r"[^A-Za-z0-9_-]", "-", leaf) or "terminal"
+    return avoid_omarchy_float_rule(APP_ID_PREFIX + leaf)
 
 
 def spawn_window(win: dict) -> None:
@@ -747,17 +1035,18 @@ def wait_for_window(before: set[str], timeout: float, want_class: str = "") -> d
 # --------------------------------------------------------------------------
 
 def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str]:
-    number = ws_plan["number"]
+    number = int(ws_plan["number"])
     monitor = ws_plan.get("monitor") or ""
     columns = fold_columns(ws_cfg.get("columns") or [], ws_plan["columns"])
-
-    rule = f'hl.workspace_rule({{ workspace = {int(number)}, layout = "dwindle"'
-    if monitor:
-        rule += f", monitor = {json.dumps(monitor)}"
-    rule += " })"
-    hypr_eval(rule)
+    # `number` is the Hyprland id. The mode file and the floating tags are
+    # keyed by that id, not by the 1-10 slot written in the config.
+    mode = read_workspace_mode(number)
+    hypr_eval(workspace_rule_lua(number, monitor, mode))
     dispatch(f'hl.dsp.focus({{ workspace = "{number}" }})')
     time.sleep(0.15)
+    # Column splits and the final resize are dwindle. Scrolling and floating
+    # workspaces still receive their windows, on the layout the user chose.
+    tile = mode == "dwindle"
 
     placed: list[list[dict]] = []   # [column][window] -> client
     problems: list[str] = []
@@ -768,7 +1057,7 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
             continue
         col_clients: list[dict] = []
         for wi, win in enumerate(wins):
-            if wi == 0 and ci > 0 and placed:
+            if tile and wi == 0 and ci > 0 and placed:
                 anchor = placed[-1][0]
                 address = safe_window_address(anchor.get("address"))
                 if not address:
@@ -776,7 +1065,7 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                     continue
                 dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
                 dispatch('hl.dsp.layout("preselect r")')
-            elif wi > 0:
+            elif tile and wi > 0:
                 anchor = col_clients[-1]
                 address = safe_window_address(anchor.get("address"))
                 if not address:
@@ -786,7 +1075,9 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                 dispatch('hl.dsp.layout("preselect d")')
 
             label = str(win.get("term") or win.get("app") or "terminal").split()[0]
-            report(f"workspace {number}: {label}")
+            shown = ws_plan.get("slot") or number
+            where = f" on {monitor}" if monitor and shown != number else ""
+            report(f"workspace {shown}{where}: {label}")
             before = {c["address"] for c in clients()}
             spawn_window(win)
             wait = float(win.get("wait") or opts.get("window_wait") or DEFAULT_WINDOW_WAIT)
@@ -803,11 +1094,13 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                 dispatch(f'hl.dsp.window.move({{ window = "address:{address}", '
                          f'workspace = "{number}", follow = false }})')
                 time.sleep(0.15)
-            if client.get("floating") and not win.get("float"):
+            if should_unfloat(client, win, mode):
                 # Some window rule floats this class -- Omarchy does it for
                 # TUIs, 1Password, media players. In a setup that leaves a
                 # hole in the column, so put the window back in the layout.
                 # `float = true` on the window opts out and keeps it floating.
+                # A window tagged by the floating workspace mode is the layout,
+                # not an app rule, and tiling it fights that mode.
                 address = safe_window_address(client.get("address"))
                 if not address:
                     problems.append("invalid Hyprland window address")
@@ -821,7 +1114,7 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
         if col_clients:
             placed.append(col_clients)
 
-    if placed:
+    if placed and tile:
         apply_sizes(number, columns, placed)
     return problems
 
@@ -1315,7 +1608,7 @@ def cmd_load(args) -> int:
         stop_services(previous_services(cfg, prev), report)
 
         if setup is None:
-            dispatch('hl.dsp.focus({ workspace = "1" })')
+            dispatch(f'hl.dsp.focus({{ workspace = "{home_workspace_id(monitors())}" }})')
             save_state(setup=EMPTY, currentKnown=True, phase="idle", loader_pid=0, step="", error="", recoverable=False, blocked=[], services=[],
                        fingerprint=fingerprint(), progress={"done": 0, "total": 0})
             notify("Empty desktop", "everything closed", replace=True)
@@ -1360,7 +1653,16 @@ def cmd_load(args) -> int:
 
         focus_ws = setup.get("focus")
         if focus_ws:
-            dispatch(f'hl.dsp.focus({{ workspace = "{int(focus_ws)}" }})')
+            wanted = int(focus_ws)
+            match = next((ws for ws in plan["workspaces"]
+                          if ws.get("slot") == wanted or ws.get("number") == wanted), None)
+            if match:
+                focus_id = int(match["number"])
+            else:
+                main = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
+                focus_id, _ = resolve_workspace_number(
+                    wanted, str(main.get("name") or "") if main else "", False, load_monitor_blocks())
+            dispatch(f'hl.dsp.focus({{ workspace = "{focus_id}" }})')
         elif plan["workspaces"]:
             # End on the first workspace of each screen, finishing on the first
             # screen -- so the desk you look at is the one you asked for.
@@ -1456,6 +1758,11 @@ def proc_exe(pid: int) -> str:
 
 def is_terminal_window(c: dict, argv: list[str]) -> bool:
     cls = (c.get("class") or "").lower()
+    # Checked before the executable. The screensaver is alacritty/ghostty/foot
+    # with class org.omarchy.screensaver, and a bare org.omarchy.* prefix
+    # would save it as a shell. The captive portal is a browser window.
+    if is_non_terminal_class(cls):
+        return False
     exe = proc_exe(int(c.get("pid") or 0))
     argv0 = Path(argv[0]).name if argv else ""
     return (exe in TERMINAL_EXES or argv0 in TERMINAL_EXES
@@ -1546,17 +1853,39 @@ def nice_weights(sizes: list[int]) -> list[int]:
     return [1] * len(sizes)
 
 
+def capture_window(c: dict) -> bool:
+    """Whether a client belongs in a captured desk.
+
+    Windows floating on their own stay out, as before. Windows the floating
+    workspace mode floated are the desk itself: they are captured with the
+    tiled windows and are not recorded as `float = true`.
+    """
+    if not c.get("mapped", True):
+        return False
+    workspace = c.get("workspace") or {}
+    try:
+        wid = int(workspace.get("id") or 0)
+    except (TypeError, ValueError):
+        return False
+    if wid < 1:  # special workspaces are not part of a setup
+        return False
+    if is_non_terminal_class(c.get("class") or ""):
+        return False
+    if c.get("floating") and not mode_floated_window(c):
+        return False
+    return True
+
+
 def snapshot() -> list[dict]:
     """Read the current desktop back as workspace/column/window structure."""
     by_ws: dict[int, list[dict]] = {}
     for c in clients():
-        if not c.get("mapped", True) or c.get("floating"):
+        if not capture_window(c):
             continue
-        wid = c["workspace"]["id"]
-        if wid < 1:  # special workspaces are not part of a setup
-            continue
+        wid = int(c["workspace"]["id"])
         by_ws.setdefault(wid, []).append(c)
 
+    blocks = load_monitor_blocks()
     workspaces = []
     for wid in sorted(by_ws):
         wins = sorted(by_ws[wid], key=lambda c: (c["at"][0], c["at"][1]))
@@ -1583,11 +1912,23 @@ def snapshot() -> list[dict]:
             out_wins = []
             for c, hw in zip(col, hws):
                 spec = window_to_spec(c)
+                # Opacity is Omarchy's concern. Apps are opaque unless they
+                # opt into transparency; terminals do that through the
+                # terminal tag. Re-applying a captured opacity would freeze
+                # the old glassy default onto the restored window.
+                spec.pop("opacity", None)
+                # Mode-floated windows are the layout, not a user float.
+                if mode_floated_window(c):
+                    spec.pop("float", None)
                 if hw != 1 or len(col) > 1:
                     spec["height"] = hw
                 out_wins.append(spec)
             out_cols.append({"width": cw, "windows": out_wins})
-        workspaces.append({"number": wid, "columns": out_cols})
+        monitor = monitor_of_workspace(wid)
+        entry = {"number": capture_workspace_number(wid, monitor, blocks), "columns": out_cols}
+        if monitor:
+            entry["monitor"] = monitor
+        workspaces.append(entry)
     return workspaces
 
 
@@ -1615,6 +1956,9 @@ def render_setup(name: str, workspaces: list[dict], services: list, icon: str = 
         lines.append("")
         lines.append("  [[setups.workspaces]]")
         lines.append(f"  number = {ws['number']}")
+        monitor = str(ws.get("monitor") or "").strip()
+        if monitor:
+            lines.append(f"  monitor = {json.dumps(monitor)}")
         lines.append("  columns = [")
         for col in ws["columns"]:
             lines.append(f"    {toml_inline(col)},")
@@ -1763,11 +2107,20 @@ def cmd_save(args) -> int:
     write_text_atomic(CONFIG_PATH, replace_setup_block(text, name, block))
 
     fp = fingerprint()
-    plan = {"workspaces": [{"index": i, "number": ws["number"],
-                            "monitor": monitor_of_workspace(ws["number"]),
-                            "columns": len(ws["columns"])}
-                           for i, ws in enumerate(workspaces)],
-            "saved": time.time()}
+    blocks = load_monitor_blocks()
+    planned = []
+    for i, ws in enumerate(workspaces):
+        explicit = bool(str(ws.get("monitor") or "").strip())
+        hypr_id, mon = resolve_workspace_number(
+            int(ws["number"]), str(ws.get("monitor") or ""), explicit, blocks)
+        planned.append({
+            "index": i,
+            "number": hypr_id,
+            "slot": int(ws["number"]) if 1 <= int(ws["number"]) <= WORKSPACE_SLOTS else workspace_slot(hypr_id),
+            "monitor": mon,
+            "columns": len(ws["columns"]),
+        })
+    plan = {"version": LAYOUT_PLAN_VERSION, "workspaces": planned, "saved": time.time()}
     remember_plan(name, fp, plan)
     save_state(setup=name, currentKnown=True, phase="idle", step="", error="")
     notify(f"Saved “{name}”", f"{len(workspaces)} workspace(s)")

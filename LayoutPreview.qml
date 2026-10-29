@@ -82,7 +82,10 @@ Row {
                   height: Math.max(2, (column.height - inner.gap * (column.heights.length - 1))
                                       * Math.max(0.1, modelData || 1) / column.heightSum)
                   radius: 1
-                  color: Qt.rgba(root.tint.r, root.tint.g, root.tint.b, root.highlight ? 0.75 : 0.38)
+                  // Omarchy 4.5 leaves ordinary windows opaque. The panes stay
+                  // solid so the thumbnail matches the desk it will restore;
+                  // the frame around them stays faint.
+                  color: Qt.rgba(root.tint.r, root.tint.g, root.tint.b, root.highlight ? 1 : 0.88)
 
                   Behavior on color { ColorAnimation { duration: 160 } }
                 }

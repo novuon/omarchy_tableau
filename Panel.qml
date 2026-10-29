@@ -86,8 +86,26 @@ Panel {
   readonly property int barSlot: barContentWidth + Style.space(10)
   readonly property real openPanelIndicatorWidth: barContentWidth
   readonly property real openPanelIndicatorHeight: barContentWidth
-  implicitWidth: bar && bar.vertical ? (bar ? bar.barSize : Style.bar.sizeHorizontal) : barSlot
-  implicitHeight: bar && bar.vertical ? barSlot : (bar ? bar.barSize : Style.bar.sizeHorizontal)
+
+  // The bar's configured size is `barSize`. A notched screen grows the strip
+  // past that, and `barSizeFor` is the thickness plugins clear. Fall back
+  // when the running shell is older than that function.
+  readonly property string hostScreenName: {
+    var bridge = root.QsWindow
+    var win = bridge && bridge.window ? bridge.window : null
+    var host = win && win.screen ? win.screen : null
+    return host && host.name ? host.name : ""
+  }
+  readonly property int barThickness: {
+    var fallback = bar && bar.barSize ? bar.barSize : Style.bar.sizeHorizontal
+    if (bar && hostScreenName !== "" && typeof bar.barSizeFor === "function") {
+      var sized = Number(bar.barSizeFor(hostScreenName))
+      if (sized > 0) return sized
+    }
+    return fallback
+  }
+  implicitWidth: bar && bar.vertical ? barThickness : barSlot
+  implicitHeight: bar && bar.vertical ? barSlot : barThickness
 
   function applySettings() {
     SetupsStore.fontFamily = root.fontFamily
@@ -117,16 +135,24 @@ Panel {
     }
   }
 
-  onNamingChanged: {
-    if (naming) {
-      nameField.text = root.namingMode === "save"
-                       ? (SetupsStore.current === "Empty" ? "" : SetupsStore.current)
-                       : ""
-      nameField.forceActiveFocus()
-      nameField.selectAll()
+  function applyNamingFocus() {
+    var page = panel.ensureContent()
+    if (!page || !page.nameField) return false
+    if (root.naming) {
+      page.nameField.text = root.namingMode === "save"
+                            ? (SetupsStore.current === "Empty" ? "" : SetupsStore.current)
+                            : ""
+      page.nameField.forceActiveFocus()
+      page.nameField.selectAll()
     } else {
-      keyCatcher.forceActiveFocus()
+      page.forceActiveFocus()
     }
+    return true
+  }
+
+  onNamingChanged: {
+    if (!root.applyNamingFocus() && root.naming)
+      Qt.callLater(root.applyNamingFocus)
   }
 
   BarIconButton {
@@ -183,15 +209,24 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: panel.loadedContent
 
+    // fittedContentHeight still caps the card. loadedContentHeight is the
+    // lazy page's own implicit height, so a setups list that arrives after
+    // the panel opens grows the card instead of staying at the empty height.
     readonly property int desiredWidth: Style.space(420)
-    contentWidth: Math.min(desiredWidth,
-                           panel.availableCardWidth > 0 ? panel.availableCardWidth : desiredWidth)
-    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, Style.space(560))
+    contentWidth: panel.fittedContentWidth(desiredWidth)
+    // The page's implicit height follows the column, including rows that
+    // appear when status returns after the card is already open.
+    // fittedContentHeight only caps that measurement against the screen.
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(560))
 
-    PanelKeyCatcher {
+    content: PanelKeyCatcher {
       id: keyCatcher
+      property alias nameField: nameField
+      readonly property real columnHeight: mainColumn.implicitHeight
+      // Independent of the card height, which is derived from this value.
+      implicitHeight: columnHeight
       anchors.fill: parent
 
       // This component bakes in vim navigation -- j/k/l/h move, x deletes --
@@ -659,6 +694,7 @@ Panel {
 
     ConfirmDialog {
       id: recoveryConfirm
+      parent: panel
       anchors.fill: parent
       z: 9
       message: root.recoveryAction === "restore"
@@ -678,6 +714,7 @@ Panel {
 
     ConfirmDialog {
       id: forceConfirm
+      parent: panel
       anchors.fill: parent
       z: 10
       message: "Close these windows anyway? Anything they were asking about is lost."
@@ -694,6 +731,7 @@ Panel {
 
     ConfirmDialog {
       id: deleteConfirm
+      parent: panel
       anchors.fill: parent
       z: 11
       message: "Delete “" + root.pendingDelete + "”? This cannot be undone from the menu."
