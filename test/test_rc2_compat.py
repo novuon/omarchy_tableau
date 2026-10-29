@@ -68,8 +68,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert plan["version"] == cli.LAYOUT_PLAN_VERSION
 
     blocks_path.parent.mkdir(parents=True)
-    blocks_path.write_text("0\teDP-1\tLaptop Panel\n1\tDP-2\tDell U2720Q\n")
+    # A duplicate connector must keep the first block, not walk onto the next.
+    blocks_path.write_text(
+        "not a row\n0\teDP-1\tLaptop Panel\n1\tDP-2\tDell U2720Q\n9\tDP-2\tlater\n")
     assert cli.load_monitor_blocks() == {"eDP-1": 0, "DP-2": 1}
+    # Slot 10 is the last id in the block, not workspace 1 of the next monitor.
+    assert cli.resolve_workspace_number(10, "DP-2", True) == (20, "DP-2")
+    assert cli.workspace_block(20) == 1
 
     # number = 3 on DP-2 is the third slot of block 1, Hyprland workspace 13.
     assert cli.resolve_workspace_number(3, "DP-2", True) == (13, "DP-2")
@@ -165,8 +170,19 @@ with tempfile.TemporaryDirectory() as tmp:
         'o.workspace_mode({ default = "scrolling" })\n')
     assert cli.read_workspace_mode(13) == "floating"
     assert cli.read_workspace_mode(2) == "scrolling"
+    # A workspace file with no mode assignment falls through to the default.
+    # The word "default" in a comment must not win.
+    (layouts / "2.lua").write_text('-- old file, default = "dwindle"\n')
+    assert cli.read_workspace_mode(2) == "scrolling"
+    (layouts / "2.lua").unlink()
     (layouts / "default.lua").unlink()
-    assert cli.read_workspace_mode(2) == "dwindle"
+    # Nothing named a mode: do not invent dwindle. Hyprland's own report
+    # is used when it has one.
+    assert cli.read_workspace_mode(2) == ""
+    assert "layout" not in cli.workspace_rule_lua(2, "eDP-1", "")
+    cli.hypr_json = lambda *args: (
+        [{"id": 2, "tiledLayout": "scrolling"}] if args == ("workspaces",) else [])
+    assert cli.read_workspace_mode(2) == "scrolling"
 
     tiled = {"floating": False}
     floated = {"floating": True, "tags": ["omarchy-mode-floated"]}

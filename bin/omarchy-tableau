@@ -636,7 +636,9 @@ def load_monitor_blocks() -> dict[str, int]:
         except ValueError:
             continue
         connector = parts[1].strip()
-        if connector and block >= 0:
+        # The first row for a connector wins. A later duplicate must not
+        # move that monitor onto the next block of ten.
+        if connector and block >= 0 and connector not in blocks:
             blocks[connector] = block
     return blocks
 
@@ -722,37 +724,74 @@ def plan_respects_blocks(plan: dict, blocks: dict[str, int]) -> bool:
     return True
 
 
-def _layout_mode(path: Path) -> str:
+def quoted_assignment(text: str, key: str) -> str:
+    """The quoted value of `key = "..."`, when it is one layout name.
+
+    Same shape Omarchy writes: `mode = "floating"` or `default = "scrolling"`.
+    A comment or the other key does not count.
+    """
+    needle = f'{key} = "'
+    start = text.find(needle)
+    if start < 0:
+        return ""
+    rest = text[start + len(needle):]
+    end = rest.find('"')
+    if end < 0:
+        return ""
+    value = rest[:end]
+    if value in ("dwindle", "scrolling", "master", "floating"):
+        return value
+    return ""
+
+
+def _layout_assignment(path: Path, key: str) -> str:
     text = read_user_file(path, 4096)
     if not text:
         return ""
-    match = re.search(r'\b(?:mode|default)\s*=\s*"([a-z]+)"', text)
-    if not match:
+    return quoted_assignment(text, key)
+
+
+def tiled_layout_name(workspace_id: int) -> str:
+    """The tiled layout Hyprland reports for this workspace, if it has one."""
+    data = hypr_json("workspaces")
+    if not isinstance(data, list):
         return ""
-    mode = match.group(1)
-    if mode in ("dwindle", "scrolling", "master", "floating"):
-        return mode
+    for workspace in data:
+        if not isinstance(workspace, dict) or workspace.get("id") != int(workspace_id):
+            continue
+        value = str(workspace.get("tiledLayout") or "").strip().lower()
+        if value in ("dwindle", "scrolling", "master"):
+            return value
     return ""
 
 
 def configured_layout() -> str:
-    """Hyprland's general layout, when no workspace mode file names one."""
+    """Hyprland's general layout, only when it actually reported one."""
     option = hypr_json("getoption", "general:layout")
     if isinstance(option, dict):
         value = str(option.get("str") or "").strip().lower()
         if value in ("dwindle", "scrolling", "master"):
             return value
-    return "dwindle"
+    return ""
 
 
 def read_workspace_mode(workspace_id: int) -> str:
-    """dwindle, scrolling, master, or floating for this Hyprland workspace."""
-    specific = _layout_mode(WORKSPACE_LAYOUTS_DIR / f"{int(workspace_id)}.lua")
+    """dwindle, scrolling, master, floating, or "" when nothing names one.
+
+    Order matches Omarchy's own helper, and Patch: this workspace's mode
+    file, then the saved default, then the tiled layout Hyprland reports,
+    then the general layout. Empty means Omarchy is not telling us, so the
+    workspace rule must not invent dwindle.
+    """
+    specific = _layout_assignment(WORKSPACE_LAYOUTS_DIR / f"{int(workspace_id)}.lua", "mode")
     if specific:
         return specific
-    default = _layout_mode(WORKSPACE_LAYOUTS_DIR / "default.lua")
+    default = _layout_assignment(WORKSPACE_LAYOUTS_DIR / "default.lua", "default")
     if default:
         return default
+    tiled = tiled_layout_name(workspace_id)
+    if tiled:
+        return tiled
     return configured_layout()
 
 
@@ -1045,9 +1084,11 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
     hypr_eval(workspace_rule_lua(number, monitor, mode))
     dispatch(f'hl.dsp.focus({{ workspace = "{number}" }})')
     time.sleep(0.15)
-    # Column splits and the final resize are dwindle. Scrolling and floating
-    # workspaces still receive their windows, on the layout the user chose.
-    tile = mode == "dwindle"
+    # Column splits are dwindle. A workspace set to scrolling or floating
+    # keeps that layout and still receives its windows. An unreadable mode
+    # is not a choice to override, so the splits still run and the rule
+    # does not stamp layout = "dwindle".
+    tile = mode in ("", "dwindle")
 
     placed: list[list[dict]] = []   # [column][window] -> client
     problems: list[str] = []
@@ -2180,11 +2221,9 @@ def cmd_save(args) -> int:
         print("could not save the current desktop", file=sys.stderr)
         return 1
 
-    saved = find_setup(load_config(), name)
-    saved_name = (saved or {}).get("name") or name
-    save_state(setup=saved_name, currentKnown=True, phase="idle", step="", error="")
-    notify(f"Saved “{saved_name}”", f"{count} workspace(s)")
-    print(f"saved {saved_name!r} to {CONFIG_PATH}")
+    save_state(setup=name, currentKnown=True, phase="idle", step="", error="")
+    notify(f"Saved “{name}”", f"{count} workspace(s)")
+    print(f"saved {name!r} to {CONFIG_PATH}")
     return 0
 
 
