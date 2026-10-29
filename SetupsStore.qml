@@ -41,6 +41,7 @@ Singleton {
   property bool actionBusy: false
   property string actionLabel: ""
   property bool restoreLast: false
+  property bool saveOnSwitch: false
   property bool recoveryOffered: false
   property bool recoverable: false
   property string recoverySetup: ""
@@ -104,6 +105,7 @@ Singleton {
     root.recoverySetup = payload.recoverySetup || ""
     root.currentKnown = payload.currentKnown === true
     root.restoreLast = payload.restoreLast === true
+    root.saveOnSwitch = payload.saveOnSwitch === true
     root.loaded = true
   }
 
@@ -180,6 +182,11 @@ Singleton {
   function offerRecovery() { root.recoveryOffered = true }
   function toggleRestoreLast() {
     actionProc.command = [root.cli, "set-option", "restore_last", root.restoreLast ? "off" : "on"]
+    root.actionBusy = true
+    actionProc.running = true
+  }
+  function toggleSaveOnSwitch() {
+    actionProc.command = [root.cli, "set-option", "save_on_switch", root.saveOnSwitch ? "off" : "on"]
     root.actionBusy = true
     actionProc.running = true
   }

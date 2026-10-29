@@ -688,6 +688,20 @@ Panel {
             fontFamily: root.fontFamily
             onClicked: SetupsStore.toggleRestoreLast()
           }
+
+          Toggle {
+            width: parent.width
+            visible: root.settingsExpanded
+            label: "Save desk when switching"
+            description: "Update the tableau you leave from the windows that are open. No question first."
+            checked: SetupsStore.saveOnSwitch
+            enabled: SetupsStore.configExists && SetupsStore.configError === ""
+                     && !SetupsStore.busy && !SetupsStore.actionBusy
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            onClicked: SetupsStore.toggleSaveOnSwitch()
+          }
         }
       }
     }

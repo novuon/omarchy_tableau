@@ -599,8 +599,9 @@ def load_config() -> dict:
                 raise ConfigError(f"option `{key}` must be a finite number")
             if not math.isfinite(value) or value <= 0 or value > 3600:
                 raise ConfigError(f"option `{key}` must be between 0 and 3600 seconds")
-    if "restore_last" in data["options"] and not isinstance(data["options"]["restore_last"], bool):
-        raise ConfigError("option `restore_last` must be true or false")
+    for key in ("restore_last", "save_on_switch"):
+        if key in data["options"] and not isinstance(data["options"][key], bool):
+            raise ConfigError(f"option `{key}` must be true or false")
     data["setups"] = setups
     return data
 
@@ -1587,6 +1588,21 @@ def cmd_load(args) -> int:
         notify(head, step, replace=True, sticky=True)
 
     try:
+        # Optional, and off unless the user turned it on. Update the tableau
+        # being left from the open windows before anything closes. No prompt:
+        # an empty desk is skipped, and a failure here does not block the switch.
+        if opts.get("save_on_switch") is True:
+            leaving = leaving_setup_name(prev, name)
+            if leaving:
+                try:
+                    remembered, _count = store_snapshot(leaving, cfg, create=False)
+                except Exception:
+                    remembered = "failed"
+                if remembered == "saved":
+                    log(f"remembered {leaving!r} before switching")
+                elif remembered not in ("empty", "missing"):
+                    log(f"could not remember {leaving!r} before switching")
+
         notify(head, "closing the current desk", sticky=True)
         # --- tear the old desk down -----------------------------------------
         save_state(phase="unloading", loader_pid=os.getpid(), step="saving and closing", error="", recoverable=False, blocked=[],
@@ -2069,42 +2085,55 @@ def cmd_duplicate(args) -> int:
     return 0
 
 
-def cmd_save(args) -> int:
-    name = args.name.strip()
-    if not name or name.lower() == EMPTY.lower():
-        print(f"{EMPTY!r} is reserved", file=sys.stderr)
-        return 1
-    try:
-        cfg = load_config()
-    except ConfigError as e:
-        print(f"config error: {e}", file=sys.stderr)
-        return 1
+def leaving_setup_name(prev: dict, target: str) -> str | None:
+    """The tableau to update before a switch, or None when there is nothing to remember.
 
+    Only a tableau Tableau itself loaded is fair game. An unknown desk, Empty,
+    and a switch back onto the same name (a retry of a half-built load) are
+    left untouched.
+    """
+    if not isinstance(prev, dict) or prev.get("currentKnown") is not True:
+        return None
+    current = str(prev.get("setup") or "").strip()
+    if not current or current.casefold() == EMPTY.casefold():
+        return None
+    if current.casefold() == str(target or "").strip().casefold():
+        return None
+    return current
+
+
+def store_snapshot(name: str, cfg: dict, *, create: bool) -> tuple[str, int]:
+    """Write the open desktop into a setup.
+
+    The status is saved, empty, missing, or unreadable. The count is how
+    many workspaces were written, or 0 when nothing was.
+
+    Services and the icon stay as declared: a desktop does not say which
+    background commands belong to it. This does not change which tableau is
+    current and does not notify. `create` is for an explicit capture of a
+    new name; remembering a desk before a switch never invents a setup.
+    """
+    existing = find_setup(cfg, name)
+    if existing is None and not create:
+        return "missing", 0
     workspaces = snapshot()
     if not workspaces:
-        print("nothing open to save", file=sys.stderr)
-        save_state(error="Nothing open to save")
-        return 1
-
-    existing = find_setup(cfg, name)
-    # Services are not detectable from the desktop; keep whatever the setup
-    # already declared rather than silently dropping them.
+        return "empty", 0
+    canonical = (existing or {}).get("name") or name
     services = (existing or {}).get("services") or []
     icon = (existing or {}).get("icon") or ""
-
-    block = render_setup(name, workspaces, services, icon)
+    block = render_setup(canonical, workspaces, services, icon)
     if CONFIG_PATH.exists():
         text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
         if text is None:
-            print("configuration file is not a readable user-owned regular file", file=sys.stderr)
-            return 1
+            return "unreadable", 0
     else:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         text = STARTER_HEADER
     if CONFIG_PATH.exists():
         write_backup(CONFIG_PATH, text)
         prune_backups(CONFIG_PATH)
-    write_text_atomic(CONFIG_PATH, replace_setup_block(text, name, block))
+    write_text_atomic(CONFIG_PATH, replace_setup_block(text, canonical, block))
 
     fp = fingerprint()
     blocks = load_monitor_blocks()
@@ -2120,11 +2149,42 @@ def cmd_save(args) -> int:
             "monitor": mon,
             "columns": len(ws["columns"]),
         })
-    plan = {"version": LAYOUT_PLAN_VERSION, "workspaces": planned, "saved": time.time()}
-    remember_plan(name, fp, plan)
-    save_state(setup=name, currentKnown=True, phase="idle", step="", error="")
-    notify(f"Saved “{name}”", f"{len(workspaces)} workspace(s)")
-    print(f"saved {name!r} to {CONFIG_PATH}")
+    remember_plan(canonical, fp, {
+        "version": LAYOUT_PLAN_VERSION,
+        "workspaces": planned,
+        "saved": time.time(),
+    })
+    return "saved", len(workspaces)
+
+
+def cmd_save(args) -> int:
+    name = args.name.strip()
+    if not name or name.lower() == EMPTY.lower():
+        print(f"{EMPTY!r} is reserved", file=sys.stderr)
+        return 1
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 1
+
+    remembered, count = store_snapshot(name, cfg, create=True)
+    if remembered == "empty":
+        print("nothing open to save", file=sys.stderr)
+        save_state(error="Nothing open to save")
+        return 1
+    if remembered == "unreadable":
+        print("configuration file is not a readable user-owned regular file", file=sys.stderr)
+        return 1
+    if remembered != "saved":
+        print("could not save the current desktop", file=sys.stderr)
+        return 1
+
+    saved = find_setup(load_config(), name)
+    saved_name = (saved or {}).get("name") or name
+    save_state(setup=saved_name, currentKnown=True, phase="idle", step="", error="")
+    notify(f"Saved “{saved_name}”", f"{count} workspace(s)")
+    print(f"saved {saved_name!r} to {CONFIG_PATH}")
     return 0
 
 
@@ -2188,6 +2248,7 @@ def cmd_status(args) -> int:
     err = ""
     setups = []
     restore_last = False
+    save_on_switch = False
     config_exists = CONFIG_PATH.exists()
     try:
         cfg = load_config()
@@ -2195,7 +2256,9 @@ def cmd_status(args) -> int:
             # Keep the examples discoverable in the menu on first launch,
             # without writing a config until the user chooses one.
             cfg = tomllib.loads(STARTER_HEADER + STARTER_BODY)
-        restore_last = (cfg.get("options") or {}).get("restore_last", False) is True
+        options = cfg.get("options") or {}
+        restore_last = options.get("restore_last", False) is True
+        save_on_switch = options.get("save_on_switch", False) is True
         for s in cfg["setups"]:
             shape, windows = setup_shape(s)
             setups.append({
@@ -2216,6 +2279,7 @@ def cmd_status(args) -> int:
         "current": st.get("setup") or EMPTY,
         "currentKnown": st.get("currentKnown", False) is True,
         "restoreLast": restore_last,
+        "saveOnSwitch": save_on_switch,
         "phase": st.get("phase", "idle"),
         "step": st.get("step", ""),
         "progress": st.get("progress", {"done": 0, "total": 0}),
@@ -2259,6 +2323,7 @@ STARTER_HEADER = """# Omarchy setups -- one block per project, loaded from the b
 [options]
 grace = 8          # seconds a window gets to close politely before we give up
 restore_last = false # offer the last Tableau after a shell restart
+save_on_switch = false # update the tableau you leave; off until you turn it on
 """
 
 
@@ -2328,8 +2393,9 @@ def cmd_init(args) -> int:
 
 def cmd_set_option(args) -> int:
     """Update a supported user option while preserving the rest of the file."""
-    if args.option != "restore_last":
-        print(f"unsupported option {args.option!r}", file=sys.stderr)
+    key = args.option
+    if key not in ("restore_last", "save_on_switch"):
+        print(f"unsupported option {key!r}", file=sys.stderr)
         return 1
     value = args.value.casefold()
     if value not in ("on", "off", "true", "false"):
@@ -2340,14 +2406,15 @@ def cmd_set_option(args) -> int:
         print("configuration file is not a readable user-owned regular file", file=sys.stderr)
         return 1
     rendered = "true" if value in ("on", "true") else "false"
-    if re.search(r"(?m)^\s*restore_last\s*=", text):
-        updated = re.sub(r"(?m)^(\s*restore_last\s*=\s*).*$", rf"\1{rendered}", text, count=1)
+    assignment = rf"(?m)^(\s*{re.escape(key)}\s*=\s*).*$"
+    if re.search(assignment, text):
+        updated = re.sub(assignment, rf"\g<1>{rendered}", text, count=1)
     elif re.search(r"(?m)^\[options\]\s*$", text):
-        updated = re.sub(r"(?m)^(\[options\]\s*$)", rf"\1\nrestore_last = {rendered}", text, count=1)
+        updated = re.sub(r"(?m)^(\[options\]\s*$)", rf"\1\n{key} = {rendered}", text, count=1)
     else:
-        updated = "[options]\nrestore_last = " + rendered + "\n\n" + text
+        updated = f"[options]\n{key} = {rendered}\n\n" + text
     config_backup_and_write(updated)
-    print(f"restore_last = {rendered}")
+    print(f"{key} = {rendered}")
     return 0
 
 
@@ -2440,7 +2507,7 @@ def main() -> int:
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("set-option", help="update a Tableau option")
-    sp.add_argument("option", choices=["restore_last"])
+    sp.add_argument("option", choices=["restore_last", "save_on_switch"])
     sp.add_argument("value", choices=["on", "off", "true", "false"])
     sp.set_defaults(func=cmd_set_option)
 

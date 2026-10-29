@@ -47,6 +47,9 @@ the new one. Nothing starts automatically at login.
 - **Empty desktop** closes all windows and stops services started by Tableau.
 - **Saved tableaus** load a desktop layout.
 - **Capture Current Desktop** saves the windows that are open now.
+- **Settings** can offer to restore the last tableau after a restart. A second
+  switch, off until you turn it on, saves the tableau you are leaving from
+  the windows that are open. Switching does not ask.
 - **Rename**, **Duplicate**, and **Delete** manage saved tableaus.
 - **Edit** opens the configuration file.
 
