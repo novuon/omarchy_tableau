@@ -34,6 +34,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # ---- a window that never opens aborts its workspace --------------------
     cli.hypr_eval = lambda lua: None
+    cli.hypr_json = lambda *args: None  # no live layout mode from the host
     cli.dispatch = lambda lua: None
     cli.clients = lambda: []
     cli.time.sleep = lambda s: None

@@ -36,6 +36,7 @@ class WindowTimeoutTests(unittest.TestCase):
         self.spawn = self.enterContext(patch.object(self.cli, "spawn_window"))
         self.dispatch = self.enterContext(patch.object(self.cli, "dispatch"))
         self.enterContext(patch.object(self.cli, "hypr_eval"))
+        self.enterContext(patch.object(self.cli, "hypr_json", return_value=None))
         self.enterContext(patch.object(self.cli, "clients", return_value=[]))
         self.enterContext(patch.object(self.cli, "notify"))
         self.enterContext(patch.object(self.cli.time, "sleep"))
