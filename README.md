@@ -231,7 +231,9 @@ starter tableaus are available immediately on a clean install, so you can try
 the workflow before editing any configuration. When you have a desk worth
 keeping, use **Capture Current Desktop** to save it.
 
-Requirements: Omarchy with the standard `omarchy-shell` and Hyprland helpers.
+Requirements: Omarchy 4.5 or newer, with the standard `omarchy-shell` and
+Hyprland helpers. On Omarchy 4.0 the bar widget does not load; stay on Tableau
+0.1.0 there, or update Omarchy first.
 Tableau uses the terminal and application launchers already provided by Omarchy;
 there are no extra services or developer tools to install.
 

@@ -32,12 +32,18 @@ if [[ -n "$qmllint_bin" ]]; then
   # singleton/component types still cannot be described completely to
   # standalone qmllint, so keep those diagnostics informational while making
   # syntax, import, and other real warnings fail validation.
-  "$qmllint_bin" -W 0 \
-    -i "${OMARCHY_PATH:-/usr/share/omarchy}/shell/Commons/qmldir" \
-    -i "${OMARCHY_PATH:-/usr/share/omarchy}/shell/Ui/qmldir" \
-    --unqualified info --missing-property info --signal-handler-parameters info \
-    --unresolved-type info \
-    LayoutPreview.qml MenuRow.qml Panel.qml SetupCard.qml SetupsStore.qml
+  qmllint_plugin() {
+    "$qmllint_bin" -W 0 \
+      -i "${OMARCHY_PATH:-/usr/share/omarchy}/shell/Commons/qmldir" \
+      -i "${OMARCHY_PATH:-/usr/share/omarchy}/shell/Ui/qmldir" \
+      --unqualified info --missing-property info --signal-handler-parameters info \
+      --unresolved-type info \
+      "$@"
+  }
+  qmllint_plugin LayoutPreview.qml MenuRow.qml Panel.qml SetupCard.qml
+  # qmldir declares SetupsStore a singleton, but standalone qmllint (Qt 6.12)
+  # cannot see that outside a QML module and reports a false import warning.
+  qmllint_plugin --import info SetupsStore.qml
 else
   echo "qmllint not found; skipping QML lint" >&2
 fi

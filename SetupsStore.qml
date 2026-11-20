@@ -48,7 +48,7 @@ Singleton {
 
   function cursorIndexForCurrent() {
     if (root.current === "Empty") return 0
-    for (var i = 0; i < root.setups.length; i++) {
+    for (let i = 0; i < root.setups.length; i++) {
       if (root.setups[i].name === root.current) return i + 1
     }
     return 0
@@ -88,7 +88,7 @@ Singleton {
     root.setups = payload.setups || []
     // A status poll can have started just before a save and finish after it.
     // Do not let that stale snapshot briefly move the selection back to Empty.
-    var reportedCurrent = payload.current || "Empty"
+    let reportedCurrent = payload.current || "Empty"
     if (!(root.actionBusy && reportedCurrent === "Empty" && root.current !== "Empty"))
       root.current = reportedCurrent
     root.phase = payload.phase || "idle"
@@ -127,7 +127,7 @@ Singleton {
     root.step = "closing windows"
     root.error = ""
     root.blocked = []
-    var args = [root.cli, "load", name]
+    let args = [root.cli, "load", name]
     if (force) args.push("--force")
     Quickshell.execDetached(args)
     Qt.callLater(root.refresh)
@@ -135,7 +135,7 @@ Singleton {
 
   function saveCurrent(name) {
     if (!name || name.trim() === "") return
-    var savedName = name.trim()
+    let savedName = name.trim()
     // Keep the card selected immediately. The CLI also persists this value;
     // this optimistic value prevents an older status poll from selecting
     // Empty while the save process is still finishing.
@@ -244,24 +244,24 @@ Singleton {
   // says what a setup *is* in a way "5 windows" never does.
   function metaFor(setup) {
     if (!setup) return ""
-    var parts = []
+    let parts = []
     if (setup.workspaces > 0) parts.push(setup.workspaces + (setup.workspaces === 1 ? " workspace" : " workspaces"))
     if (setup.windows > 0) parts.push(setup.windows + (setup.windows === 1 ? " window" : " windows"))
-    var services = setup.services || 0
+    let services = setup.services || 0
     if (services > 0) parts.push(services + (services === 1 ? " service" : " services"))
-    var layout = setup.layout || []
-    for (var w = 0; w < layout.length; w++) {
-      var cols = layout[w].columns || []
-      for (var c = 0; c < cols.length; c++) {
-        var labels = cols[c].labels || []
-        for (var i = 0; i < labels.length; i++) parts.push(labels[i])
+    let layout = setup.layout || []
+    for (let w = 0; w < layout.length; w++) {
+      let cols = layout[w].columns || []
+      for (let c = 0; c < cols.length; c++) {
+        let labels = cols[c].labels || []
+        for (let i = 0; i < labels.length; i++) parts.push(labels[i])
       }
     }
     return parts.join(" · ")
   }
 
   readonly property string tooltip: {
-    var s = current === "Empty" ? "Empty desktop" : current
+    let s = current === "Empty" ? "Empty desktop" : current
     if (busy) s = headline
     return "Tableau — " + s
   }

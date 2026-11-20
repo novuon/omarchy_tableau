@@ -44,8 +44,8 @@ Row {
         readonly property var cols: screen.modelData && screen.modelData.columns ? screen.modelData.columns : []
         readonly property real gap: 2
         readonly property real weightSum: {
-          var total = 0
-          for (var i = 0; i < cols.length; i++) total += Math.max(0.1, cols[i].w || 1)
+          let total = 0
+          for (let i = 0; i < cols.length; i++) total += Math.max(0.1, cols[i].w || 1)
           return total > 0 ? total : 1
         }
 
@@ -62,8 +62,8 @@ Row {
 
               readonly property var heights: modelData && modelData.h && modelData.h.length ? modelData.h : [1]
               readonly property real heightSum: {
-                var total = 0
-                for (var i = 0; i < heights.length; i++) total += Math.max(0.1, heights[i] || 1)
+                let total = 0
+                for (let i = 0; i < heights.length; i++) total += Math.max(0.1, heights[i] || 1)
                 return total > 0 ? total : 1
               }
 

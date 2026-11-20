@@ -177,7 +177,9 @@ with tempfile.TemporaryDirectory() as tmp:
     (layouts / "2.lua").unlink()
     (layouts / "default.lua").unlink()
     # Nothing named a mode: do not invent dwindle. Hyprland's own report
-    # is used when it has one.
+    # is used when it has one. Stub Hyprland so the host's live layout
+    # cannot leak into this check.
+    cli.hypr_json = lambda *args: None
     assert cli.read_workspace_mode(2) == ""
     assert "layout" not in cli.workspace_rule_lua(2, "eDP-1", "")
     cli.hypr_json = lambda *args: (

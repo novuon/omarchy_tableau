@@ -92,14 +92,14 @@ Panel {
   // when the running shell is older than that function.
   readonly property string hostScreenName: {
     var bridge = root.QsWindow
-    var win = bridge && bridge.window ? bridge.window : null
-    var host = win && win.screen ? win.screen : null
+    const win = bridge && bridge.window ? bridge.window : null
+    const host = win && win.screen ? win.screen : null
     return host && host.name ? host.name : ""
   }
   readonly property int barThickness: {
-    var fallback = bar && bar.barSize ? bar.barSize : Style.bar.sizeHorizontal
+    const fallback = bar && bar.barSize ? bar.barSize : Style.bar.sizeHorizontal
     if (bar && hostScreenName !== "" && typeof bar.barSizeFor === "function") {
-      var sized = Number(bar.barSizeFor(hostScreenName))
+      const sized = Number(bar.barSizeFor(hostScreenName))
       if (sized > 0) return sized
     }
     return fallback
@@ -708,7 +708,6 @@ Panel {
 
     ConfirmDialog {
       id: recoveryConfirm
-      parent: panel
       anchors.fill: parent
       z: 9
       message: root.recoveryAction === "restore"
@@ -728,7 +727,6 @@ Panel {
 
     ConfirmDialog {
       id: forceConfirm
-      parent: panel
       anchors.fill: parent
       z: 10
       message: "Close these windows anyway? Anything they were asking about is lost."
@@ -745,7 +743,6 @@ Panel {
 
     ConfirmDialog {
       id: deleteConfirm
-      parent: panel
       anchors.fill: parent
       z: 11
       message: "Delete “" + root.pendingDelete + "”? This cannot be undone from the menu."
