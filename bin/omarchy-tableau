@@ -109,7 +109,7 @@ TERMINAL_CLASSES = {
 
 DEFAULT_GRACE = 8          # seconds a window gets to close politely
 DEFAULT_WINDOW_WAIT = 20   # seconds a window gets to appear after launching
-LAYOUT_PLAN_VERSION = 3    # plans store Hyprland ids inside each monitor's block of ten
+LAYOUT_PLAN_VERSION = 4    # implicit workspaces are no longer pinned outside monitor blocks
 
 
 # --------------------------------------------------------------------------
@@ -917,9 +917,13 @@ def max_columns(width: int) -> int:
 def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict:
     """Decide which workspace lands on which screen, and how many columns.
 
-    Empty monitor preferences use the focused monitor (or the first monitor
-    when Hyprland has not reported one). An explicit monitor preference is
-    matched against both its connector name and description. A remembered
+    A workspace without a monitor preference is sized for the focused
+    monitor (or the first one when Hyprland has not reported focus). It is
+    pinned only inside Omarchy's per-monitor blocks, where the focused
+    monitor owns the id; otherwise it stays wherever Hyprland's own workspace
+    rules (the user's config, hyprmoncfg, ...) put it. An explicit monitor
+    preference is matched against both its connector name and description,
+    and falls back to the focused monitor. A remembered
     plan wins only when it uses the current assignment rules, every screen
     it names is still here, and each workspace id still belongs to that
     monitor's block.
@@ -932,8 +936,8 @@ def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict
     blocks = load_monitor_blocks()
     if (remembered and remembered.get("version") == LAYOUT_PLAN_VERSION
             and plan_respects_blocks(remembered, blocks)):
-        wanted = {w.get("monitor") for w in remembered.get("workspaces", [])}
-        if wanted and wanted.issubset(set(names)):
+        wanted = {w.get("monitor") for w in remembered.get("workspaces", []) if w.get("monitor")}
+        if wanted.issubset(set(names)):
             return remembered
 
     workspaces = setup.get("workspaces") or []
@@ -956,6 +960,11 @@ def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict
         mon_name = mon["name"] if mon else ""
         config_number = int(ws.get("number") or (i + 1))
         hypr_id, mon_name = resolve_workspace_number(config_number, mon_name, explicit, blocks)
+        if not pref and not blocks:
+            # Without per-monitor blocks, a monitor in the workspace rule would
+            # override the user's own rules on every load: Hyprland merges a
+            # runtime rule into theirs and moves persistent workspaces.
+            mon_name = ""
         width = logical_size(mon)[0] if mon else 1920
         declared = len(ws.get("columns") or []) or 1
         plan_ws.append({

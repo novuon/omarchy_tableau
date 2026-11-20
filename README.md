@@ -153,6 +153,12 @@ id inside that monitor's block is left alone, and with no
 
 If the display is not connected, Tableau uses the focused monitor.
 
+Without `monitor`, Tableau pins nothing while Omarchy is not writing
+`monitor-workspaces`: the workspace opens wherever your own Hyprland workspace
+rules put it, so tools like hyprmoncfg keep working. With per-monitor
+workspaces, the number lands in the focused monitor's block of ten, which that
+monitor already owns.
+
 ### Layout and opacity
 
 Tableau builds columns with dwindle splits. A workspace set to scrolling or
