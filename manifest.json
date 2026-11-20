@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "novuon.tableau",
   "name": "Tableau",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": "Novuon",
   "description": "Load a whole desk in one click: workspaces, windows and services per project",
   "license": "MIT",
